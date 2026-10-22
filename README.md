@@ -25,8 +25,7 @@ scripts/
   build-adt.py      inputs/negroni.adt with mkadt
   build-payload.py  out/esp.img (UniXNU config + DarwinBoot inputs) from board.toml
   build-bootimg.py  out/boot_a.img (Mu-Silicium + shim + payload)
-  flash.py          fastboot boot_a / switch to OrangeFox / dd all iOS boot images
-  pull-log.py       read and decode the persistent console log from OrangeFox
+  flash.py          flash out/boot_a.img with fastboot
 patches/            where changes to external trees live
 inputs/  out/       kernels, ADT, images, logs (ignored)
 ```
@@ -38,15 +37,7 @@ cd unixnu
 scripts/fetch-kernel.py                 # newest green kernel build
 scripts/build-payload.py                # boot args from board.toml
 scripts/build-bootimg.py
-scripts/flash.py fastboot --reboot      # phone in fastboot, other partitions already iOS
-```
-
-From stock/OrangeFox, or to read the log:
-
-```sh
-scripts/flash.py recovery               # fastboot -> stock boot images -> OrangeFox
-scripts/pull-log.py boot-NNNN "panic" "spawn FAIL"
-scripts/flash.py dd --reboot            # write the iOS boot images back, reboot into iOS
+scripts/flash.py --reboot               # phone in fastboot
 ```
 
 A one-off boot arg without editing the board file:
@@ -54,8 +45,6 @@ A one-off boot arg without editing the board file:
 ```sh
 scripts/build-payload.py --drop negronifb_clockshift= --arg negronifb_clockshift=80
 ```
-
-Userdata (the iOS root) is never written by these scripts.
 
 ## Inputs that stay out of git
 
