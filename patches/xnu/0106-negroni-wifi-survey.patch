@@ -1,0 +1,300 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4f94a31..1897319 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/negroni_keys.c			standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_adreno.c		standard
++bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 6ef22fd..43b6ef2 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -355,4 +355,21 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/* Read-only cmd-db lookup of a VRM resource address (Wi-Fi survey, negroni_wifi.c). */
++int negroni_rpmh_lookup(const char *res, uint32_t *address);
++
++int
++negroni_rpmh_lookup(const char *res, uint32_t *address)
++{
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, address);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index be19c79..33468d6 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -55,6 +55,7 @@ extern void negroni_keys_init(void);
+ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
+ extern void negroni_adreno_init(void);
++extern void negroni_wifi_init(void);
+ extern void negroni_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -738,6 +739,7 @@ negroni_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
+ 	negroni_cpufreq_init();
+ 	negroni_adreno_init();
++	negroni_wifi_init();
+ 	negroni_keys_init();
+ 	negroni_touch_init();
+ 	negroni_usb_probe();
+diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
+new file mode 100644
+index 0000000..a068ce9
+--- /dev/null
++++ b/bsd/dev/negroni_wifi.c
+@@ -0,0 +1,178 @@
++/*
++ * NEGRONI (SM8450) Wi-Fi: QCA6490 (ath11k "WCN6855 hw2.1") on PCIe0, brought
++ * up step by step like negroni_adreno.c (Linux ath11k/MHI as the reference;
++ * the chip sits on PCIe0). Steps 1-4 only read.
++ *
++ * Boot arg negroniwifi=N performs steps 1..N (default 0: nothing).
++ *   1  reads   GCC PCIe0: the GDSC and the branches (AUX, CFG AHB, MSTR/SLV AXI, PIPE)
++ *   2  reads   TLMM pins: WLAN_EN 80, BT_EN 81, SW_CTRL 82, PERST 94, WAKE 96, XO_CLK 204
++ *   3  reads   cmd-db: the RPMh addresses of the chip's rails (vendor DT qcom,cnss-qca6490:
++ *              aon smpe2 1.012 V, dig smpb11 0.966 V, io smpb10 1.8 V, rfa1 smpc1 1.9 V,
++ *              rfa2 smpb12 1.35 V)
++ *   4  reads   PCIe0 PARF (0x1c00000) and the PHY (0x1c06000), only if CFG AHB runs: what ABL left
++ *
++ * Addresses: sm8450.dtsi pcie@1c00000 / phy@1c06000, gcc-sm8450.c, the phone's DT.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int negroni_rpmh_lookup(const char *res, uint32_t *address);
++void negroni_wifi_init(void);
++
++/* corner badge, second line (NegroniFramebuffer) */
++char negroni_wifi_badge[24] = "";
++uint32_t negroni_wifi_badge_color = 0x00606060;
++
++#define GCC_PHYS                0x00100000UL
++#define GCC_SIZE                0x1f4200UL
++#define GCC_PCIE_0_GDSCR        0x7b004
++#define GCC_PCIE_0_SLV_AXI      0x7b020
++#define GCC_PCIE_0_MSTR_AXI     0x7b028
++#define GCC_PCIE_0_CFG_AHB      0x7b030
++#define GCC_PCIE_0_AUX          0x7b034
++#define GCC_PCIE_0_PIPE         0x7b03c
++#define CBCR_OFF                (1u << 31)
++#define GDSC_PWR_ON             (1u << 31)
++
++#define TLMM_PHYS               0x0f100000UL
++#define TLMM_PIN(n)             ((vm_offset_t)(n) * 0x1000)
++#define TLMM_SIZE               (TLMM_PIN(210))
++
++#define PARF_PHYS               0x01c00000UL
++#define PARF_SIZE               0x3000UL
++#define PARF_SYS_CTRL           0x00
++#define PARF_PHY_CTRL           0x40
++#define PARF_LTSSM              0x1b0
++#define PHY_PHYS                0x01c06000UL
++#define PHY_SIZE                0x2000UL
++
++static uint32_t pause_ms = 300;
++static uint32_t step;
++static vm_offset_t gcc, tlmm;
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void
++announce(const char *what)
++{
++	printf("NEGRONI WIFI: %u about to %s\n", step, what);
++	delay(pause_ms * 1000);
++}
++
++static bool
++step_gcc(void)
++{
++	static const struct { const char *name; uint32_t off; } r[] = {
++		{ "GCC_PCIE_0_AUX_CLK", GCC_PCIE_0_AUX }, { "GCC_PCIE_0_CFG_AHB_CLK", GCC_PCIE_0_CFG_AHB },
++		{ "GCC_PCIE_0_MSTR_AXI_CLK", GCC_PCIE_0_MSTR_AXI }, { "GCC_PCIE_0_SLV_AXI_CLK", GCC_PCIE_0_SLV_AXI },
++		{ "GCC_PCIE_0_PIPE_CLK", GCC_PCIE_0_PIPE },
++	};
++	uint32_t g;
++
++	announce("read the GCC PCIe0 GDSC and clocks");
++	g = rd(gcc + GCC_PCIE_0_GDSCR);
++	printf("NEGRONI WIFI: 1 PCIE_0_GDSC = %#x (%s)\n", g, (g & GDSC_PWR_ON) ? "powered" : "off");
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		uint32_t v = rd(gcc + r[i].off);
++		printf("NEGRONI WIFI: 1 %s = %#x (%s)\n", r[i].name, v, (v & CBCR_OFF) ? "off" : "running");
++	}
++	return true;
++}
++
++static bool
++step_pins(void)
++{
++	static const struct { const char *name; uint32_t pin; } p[] = {
++		{ "WLAN_EN", 80 }, { "BT_EN", 81 }, { "SW_CTRL", 82 }, { "PERST", 94 }, { "WAKE", 96 }, { "XO_CLK", 204 },
++	};
++
++	announce("read the Wi-Fi pins (TLMM)");
++	for (unsigned i = 0; i < sizeof(p) / sizeof(p[0]); i++) {
++		uint32_t cfg = rd(tlmm + TLMM_PIN(p[i].pin)), io = rd(tlmm + TLMM_PIN(p[i].pin) + 4);
++		printf("NEGRONI WIFI: 2 GPIO%u %s: cfg %#x (func %u, %s, drive %u mA, pull %u) in %u out %u\n",
++		    p[i].pin, p[i].name, cfg, (cfg >> 2) & 0xf, (cfg >> 9) & 1 ? "output" : "input",
++		    2 * (((cfg >> 6) & 7) + 1), cfg & 3, io & 1, (io >> 1) & 1);
++	}
++	return true;
++}
++
++static bool
++step_rails(void)
++{
++	static const char *const rails[] = { "smpe2", "smpb11", "smpb10", "smpc1", "smpb12" };
++	unsigned found = 0;
++
++	announce("look the Wi-Fi rails up in cmd-db (read only)");
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		uint32_t address = 0;
++		int error = negroni_rpmh_lookup(rails[i], &address);
++		printf("NEGRONI WIFI: 3 %s -> %s %#x\n", rails[i], error ? "error" : "address", error ? (uint32_t)error : address);
++		found += !error;
++	}
++	return found == sizeof(rails) / sizeof(rails[0]);
++}
++
++static bool
++step_pcie(void)
++{
++	vm_offset_t parf, phy;
++
++	if (rd(gcc + GCC_PCIE_0_CFG_AHB) & CBCR_OFF) {
++		printf("NEGRONI WIFI: 4 PCIe0 CFG AHB is off: its registers have no clock (bring-up writes it later)\n");
++		return true;
++	}
++	announce("read PCIe0 PARF and PHY as ABL left them");
++	parf = ml_io_map(PARF_PHYS, PARF_SIZE);
++	phy = ml_io_map(PHY_PHYS, PHY_SIZE);
++	printf("NEGRONI WIFI: 4 PARF SYS_CTRL %#x PHY_CTRL %#x LTSSM %#x\n", rd(parf + PARF_SYS_CTRL),
++	    rd(parf + PARF_PHY_CTRL), rd(parf + PARF_LTSSM));
++	printf("NEGRONI WIFI: 4 PHY [0x0] %#x [0x214] %#x\n", rd(phy), rd(phy + 0x214));
++	return true;
++}
++
++static bool (*const steps[])(void) = { step_gcc, step_pins, step_rails, step_pcie };
++
++void
++negroni_wifi_init(void)
++{
++	uint32_t last = 0;
++	bool failed = false;
++
++	(void)PE_parse_boot_argn("negroniwifi", &last, sizeof(last));
++	(void)PE_parse_boot_argn("negroniwifi_pause", &pause_ms, sizeof(pause_ms));
++	if (last == 0) {
++		return;
++	}
++	last = MIN(last, (uint32_t)(sizeof(steps) / sizeof(steps[0])));
++	printf("NEGRONI WIFI: steps 1..%u\n", last);
++	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++	for (step = 1; step <= last; step++) {
++		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WIFI %u", step);
++		negroni_wifi_badge_color = 0x00d0a000;
++		if (!steps[step - 1]()) {
++			failed = true;
++			break;
++		}
++	}
++	if (failed) {
++		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WIFI STOP %u", step);
++		negroni_wifi_badge_color = 0x00c00000;
++	} else {
++		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WIFI OK %u", last);
++		negroni_wifi_badge_color = 0x000060c0;
++	}
++	printf("NEGRONI WIFI: done (asked %u)\n", last);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index de9ee27..d8cdd6c 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -39,6 +39,8 @@
+ extern "C" int negroni_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" char negroni_gpu_badge[24];   /* bsd/dev/negroni_adreno.c */
+ extern "C" uint32_t negroni_gpu_badge_color;
++extern "C" char negroni_wifi_badge[24];   /* bsd/dev/negroni_wifi.c */
++extern "C" uint32_t negroni_wifi_badge_color;
+ extern "C" unsigned char iso_font[256 * 16];
+ 
+ #if defined(NEGRONI)
+@@ -317,23 +319,24 @@ AppleCLCD::swap(const uint8_t *rec)
+  * every frame iOS presents carries it.
+  */
+ static void
+-negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++negroni_draw_text_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height,
++    const char *text, uint32_t color, int top)
+ {
+-	const int scale = 3, pad = 12, top = 96;
+-	size_t n = strnlen(negroni_gpu_badge, sizeof(negroni_gpu_badge));
++	const int scale = 3, pad = 12;
++	size_t n = strnlen(text, 24);
+ 	int bw = (int)n * 8 * scale + 2 * pad, bh = 16 * scale + 2 * pad;
+ 	int x0 = (int)width - bw - 24;
+ 
+-	if (x0 < 0 || top + bh > (int)height) {
++	if (n == 0 || x0 < 0 || top + bh > (int)height) {
+ 		return;
+ 	}
+ 	for (int y = 0; y < bh; y++) {
+ 		uint32_t *row = (uint32_t *)(pixels + (uint64_t)(top + y) * rowBytes) + x0;
+ 		for (int x = 0; x < bw; x++) {
+-			uint32_t c = negroni_gpu_badge_color;
++			uint32_t c = color;
+ 			int gx = x - pad, gy = y - pad;
+ 			if (gx >= 0 && gy >= 0 && gy < 16 * scale && gx < (int)n * 8 * scale) {
+-				unsigned char ch = (unsigned char)negroni_gpu_badge[gx / (8 * scale)];
++				unsigned char ch = (unsigned char)text[gx / (8 * scale)];
+ 				unsigned char bits = iso_font[ch * 16 + gy / scale];
+ 				if (bits & (1u << ((gx / scale) % 8))) {
+ 					c = 0x00ffffff;
+@@ -344,6 +347,13 @@ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t
+ 	}
+ }
+ 
++static void
++negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_gpu_badge, negroni_gpu_badge_color, 96);
++	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_wifi_badge, negroni_wifi_badge_color, 96 + 84);
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {

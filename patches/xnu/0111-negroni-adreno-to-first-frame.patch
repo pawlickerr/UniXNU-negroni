@@ -1,0 +1,546 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index ed22e56..2115af8 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -36,6 +36,15 @@
+  *  16  writes  the HFI queue table (command, response, debug) and starts the queues (HFI_CTRL_INIT)
+  *  17  talks   HFI (a6xx_hfi_start): perf table (GX/CX arc votes from cmd-db gfx/mx/cx.lvl and the
+  *              sm8450 GPU/GMU OPP levels), A730 bw table (SH0/MC0/ACV), CORE_FW_START, START
++ *  18  asks    the GMU to power the 3D core: OOB GPU_SET (request bit 30, ack bit 31), then GX GDSC
++ *              must read powered and the GPU's RBBM registers must answer
++ *  19  writes  the 3D core's memory: ring, SQE microcode (a730_sqe.fw), scratch; an SMMU context for
++ *              its streams 0 and 1 (BR and BV/LPAC)
++ *  20  writes  hw_init for A730 (Linux hw_init, a7xx paths; no clock gating or CP protection yet),
++ *              SQE base, ring base, starts the SQE and sends a7xx_cp_init
++ *  21  asks    TrustZone to load the zap shader (PAS mem setup at 0x8b91a000 + a730_zap.b02, auth and
++ *              reset), then CP_SET_SECURE_MODE 0 and a CP_MEM_WRITE of a word into our scratch page
++ *  22  draws   a 1080x2400 picture with the 2D engine (three bands) and checks its pixels
+  * negroniadreno_pause=MS waits after each announcement (default 500), so the
+  * persistent log has the line before a silent reset.
+  *
+@@ -1410,11 +1419,481 @@ step_hfi_messages(void)
+ 	return !space_faulted(&gmu_space);
+ }
+ 
++
++/* ---- step 18: the 3D core powered (a6xx_gmu_set_oob GMU_OOB_GPU_SET, non-legacy bits) ---- */
++
++#define OOB_GPU_SET_REQUEST     30
++#define OOB_GPU_SET_ACK         31
++#define GPU_RBBM_STATUS         0x0210          /* dword, GPU space */
++
++static bool gx_on;
++
++static bool
++step_core_power(void)
++{
++	if (!gmu_started) {
++		printf("NEGRONI ADRENO: 18 stop: the GMU does not run\n");
++		return false;
++	}
++	announce("ask the GMU to power the 3D core (OOB GPU_SET)");
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << OOB_GPU_SET_REQUEST);
++	bool acked = wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << OOB_GPU_SET_ACK,
++	    1u << OOB_GPU_SET_ACK, 100);
++	wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1u << OOB_GPU_SET_ACK);
++	uint32_t gx = rd(gpucc + GPUCC_GX_GDSCR);
++	printf("NEGRONI ADRENO: 18 OOB GPU_SET %s (INTR_INFO %#x), GX GDSC %#x (%s)\n", acked ? "acked" : "NOT ACKED",
++	    rd(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO)), gx, (gx & GDSC_PWR_ON) ? "powered" : "off");
++	if (!acked || !(gx & GDSC_PWR_ON)) {
++		space_faulted(&gmu_space);
++		return false;
++	}
++	gx_on = true;
++	printf("NEGRONI ADRENO: 18 3D CORE POWERED: RBBM_STATUS %#x\n", rd(gpu_regs + 4 * GPU_RBBM_STATUS));
++	return !space_faulted(&gmu_space);
++}
++
++
++/* ---- steps 19-22: the 3D core's memory, start, zap, first work (Linux a6xx_gpu.c) ---- */
++
++#define GPU_WORD(dw)            (4 * (vm_offset_t)(dw))
++#define PTE_UNPRIVILEGED        (1ull << 6)
++#define PTE_READ_ONLY           (1ull << 7)
++#define CORE_RING_ADDRESS       0x01000000u
++#define CORE_RING_SIZE          0x8000u
++#define CORE_SQE_ADDRESS        0x01100000u
++#define CORE_SCRATCH_ADDRESS    0x01200000u
++#define CORE_TARGET_ADDRESS     0x10000000u
++#define RING_WORDS              (CORE_RING_SIZE / 4)
++
++#define REG_GBIF_HALT           0x3c45
++#define REG_RBBM_GBIF_HALT      0x0016
++#define REG_RBBM_GBIF_CLIENT_QOS 0x0011
++#define REG_RBBM_SECVID_TSB_CNTL 0xf803
++#define REG_RBBM_SECVID_TSB_BASE 0xf800
++#define REG_RBBM_SECVID_TSB_SIZE 0xf802
++#define REG_UCHE_GBIF_GX_CONFIG 0x0e3a
++#define REG_RBBM_PERFCTR_BUSY   0x050b
++#define REG_UCHE_TRAP_BASE      0x0e09
++#define REG_UCHE_WRITE_THRU     0x0e07
++#define REG_UCHE_CACHE_WAYS     0x0e17
++#define REG_CP_AHB_CNTL         0x098d
++#define REG_RBBM_PERFCTR_CNTL   0x0500
++#define REG_RBBM_HANG_INT_CNTL  0x001f
++#define REG_UCHE_CLIENT_PF      0x0e19
++#define REG_UCHE_CMDQ_CONFIG    0x0e3c
++#define REG_CP_APRIV_CNTL       0x0844
++#define REG_CP_BV_APRIV_CNTL    0x0ad0
++#define REG_CP_LPAC_APRIV_CNTL  0x0b31
++#define REG_RB_CMP_DBG_ECO_CNTL 0x8e28
++#define REG_CP_SQE_INSTR_BASE   0x0830
++#define REG_CP_RB_BASE          0x0800
++#define REG_CP_RB_CNTL          0x0802
++#define REG_CP_RB_RPTR_ADDR     0x0804
++#define REG_CP_BV_RB_RPTR_ADDR  0x0a98
++#define REG_CP_SQE_CNTL         0x0808
++#define REG_CP_RB_RPTR          0x0806
++#define REG_CP_RB_WPTR          0x0807
++#define REG_RBBM_STATUS         0x0210
++#define REG_RBBM_INT_0_STATUS   0x0201
++#define REG_CP_HW_FAULT         0x0821
++#define REG_CP_INTERRUPT_STATUS 0x0823
++#define REG_RB_NC_MODE_CNTL     0x8e08
++#define REG_TPL1_NC_MODE_CNTL   0xb604
++#define REG_SP_NC_MODE_CNTL     0xae02
++#define REG_UCHE_MODE_CNTL      0x0e01
++#define REG_RBBM_NC_MODE_CNTL   0x0534
++#define REG_GRAS_NC_MODE_CNTL   0x8602
++#define UCHE_TRAP_BASE_VALUE    0x0001fffffffff000ull
++#define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 32K ring, 32-byte blocks, no rptr copy */
++
++#define CP_NOP                  0x10
++#define CP_THREAD_CONTROL       0x17
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_MEM_WRITE            0x3d
++#define CP_EVENT_WRITE7         0x46
++#define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++#define EVENT_CCU_FLUSH_COLOR   0x1d
++#define EVENT_CACHE_CLEAN       0x31
++
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_THREE_VALUES        3
++#define ZAP_MEMORY              0x8b91a000ull   /* the phone's DT: gpu_micro_code_region@8b91a000, 0x2000 */
++#define ZAP_MEMORY_SIZE         0x2000u
++
++static struct gpu_space core_space = { .name = "the 3D core" };
++static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
++static bool core_space_on, core_runs, core_unsecure;
++static uint32_t ring_at, ring_sent;
++
++static void
++gpu_put(const char *name, uint32_t dw, uint32_t value)
++{
++	put(gpu_regs, name, GPU_WORD(dw), value);
++}
++
++static void
++gpu_put64(const char *name, uint32_t dw, uint64_t value)
++{
++	gpu_put(name, dw, (uint32_t)value);
++	gpu_put(name, dw + 1, (uint32_t)(value >> 32));
++}
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28))) & 1;
++}
++
++static void
++ring(uint32_t word)
++{
++	((uint32_t *)core_ring.memory)[ring_at] = word;
++	ring_at = (ring_at + 1) % RING_WORDS;
++}
++
++/* PM4 type 7 packet header */
++static void
++ring_command(uint32_t opcode, uint32_t words)
++{
++	ring(7u << 28 | words | odd_parity(words) << 15 | opcode << 16 | odd_parity(opcode) << 23);
++}
++
++/* PM4 type 4 packet: one register */
++static void
++ring_register(uint32_t number, uint32_t value)
++{
++	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
++	ring(value);
++}
++
++static bool
++ring_run(const char *what)
++{
++	uint32_t taken = ~0u, status = ~0u;
++
++	if (ring_at >= ring_sent) {
++		to_memory(core_ring.memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
++	} else {
++		to_memory(core_ring.memory + 4 * ring_sent, 4 * (RING_WORDS - ring_sent));
++		to_memory(core_ring.memory, 4 * ring_at);
++	}
++	ring_sent = ring_at;
++	printf("NEGRONI ADRENO: %u the 3D core is to %s (ring to word %u)\n", step, what, ring_at);
++	delay(pause_ms * 1000);
++	wr(gpu_regs + GPU_WORD(REG_CP_RB_WPTR), ring_at);
++	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
++		delay(100);
++		taken = rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR));
++		status = rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS));
++	}
++	if (taken == ring_at && !(status & ~1u) && rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)) == 0 &&
++	    !space_faulted(&core_space)) {
++		printf("NEGRONI ADRENO: %u done (rptr %u, RBBM_STATUS %#x)\n", step, taken, status);
++		return true;
++	}
++	printf("NEGRONI ADRENO: %u stop: the 3D core does not get through: rptr %u of %u, RBBM_STATUS %#x, INT_0 %#x, "
++	    "CP_HW_FAULT %#x, CP_INT %#x\n", step, taken, ring_at, status, rd(gpu_regs + GPU_WORD(REG_RBBM_INT_0_STATUS)),
++	    rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)), rd(gpu_regs + GPU_WORD(REG_CP_INTERRUPT_STATUS)));
++	space_faulted(&core_space);
++	return false;
++}
++
++/* One more stream through a context that is already on. */
++static bool
++space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
++{
++	put(smmu, "S2CR", SMMU_S2CR(match), space->context);
++	put(smmu, "SMR", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
++	return rd(smmu + SMMU_SMR(match)) == (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) &&
++	       (rd(smmu + SMMU_S2CR(match)) & 0x300ff) == space->context;
++}
++
++static bool
++core_block(struct gpu_block *b, const char *name, uint64_t address, uint32_t size, uint64_t extra)
++{
++	b->address = address;
++	b->size = (size + 4095) & ~4095u;
++	if (kmem_alloc(kernel_map, &b->memory, round_page(b->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("NEGRONI ADRENO: %u no memory for %s\n", step, name);
++		return false;
++	}
++	for (uint32_t off = 0; off < b->size; off += 4096) {
++		if (!space_map(&core_space, address + off, kvtophys(b->memory + off), PTE_GMU | PTE_UNPRIVILEGED | extra)) {
++			return false;
++		}
++	}
++	to_memory(b->memory, b->size);
++	printf("NEGRONI ADRENO: %u %s: the 3D core sees %#llx..%#llx\n", step, name, address, address + b->size - 1);
++	return true;
++}
++
++static bool
++step_core_space(void)
++{
++	const uint8_t *sqe;
++	uint32_t size = 0, match1 = ~0u;
++
++	if (!gx_on) {
++		printf("NEGRONI ADRENO: 19 stop: the 3D core has no power (step 18)\n");
++		return false;
++	}
++	sqe = negroni_fw_get("a730_sqe.fw", &size);
++	if (sqe == NULL || size < 8 || size > 0x40000) {
++		printf("NEGRONI ADRENO: 19 stop: no a730_sqe.fw in the firmware area\n");
++		return false;
++	}
++	announce("make the 3D core's ring, microcode and scratch memory");
++	if (!core_block(&core_ring, "ring", CORE_RING_ADDRESS, CORE_RING_SIZE, 0) ||
++	    !core_block(&core_sqe, "sqe", CORE_SQE_ADDRESS, size - 4, PTE_READ_ONLY) ||
++	    !core_block(&core_scratch, "scratch", CORE_SCRATCH_ADDRESS, 4096, 0)) {
++		return false;
++	}
++	memcpy((void *)core_sqe.memory, sqe + 4, size - 4);     /* the file's first word is not microcode */
++	to_memory(core_sqe.memory, core_sqe.size);
++	if (!space_pick(&core_space, 0)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < smmu_matches && i < 128; i++) {
++		if (i != core_space.match && i != gmu_space.match && !(rd(smmu + SMMU_SMR(i)) >> 31)) {
++			match1 = i;
++			break;
++		}
++	}
++	announce("route the 3D core's streams 0 and 1 through an SMMU context with these tables");
++	core_space_on = space_on(&core_space, 0);
++	if (!core_space_on || match1 == ~0u || !space_stream(&core_space, match1, 1)) {
++		printf("NEGRONI ADRENO: 19 stop: streams 0/1 not routed (second entry %d)\n", (int)match1);
++		return false;
++	}
++	return !space_faulted(&core_space);
++}
++
++static bool
++step_core_start(void)
++{
++	if (!core_space_on) {
++		printf("NEGRONI ADRENO: 20 stop: no 3D core memory (step 19)\n");
++		return false;
++	}
++	announce("write the 3D core's registers (Linux hw_init, A730)");
++	gpu_put("GBIF_HALT", REG_GBIF_HALT, 0);
++	gpu_put("RBBM_GBIF_HALT", REG_RBBM_GBIF_HALT, 0);
++	gpu_put("RBBM_SECVID_TSB_CNTL", REG_RBBM_SECVID_TSB_CNTL, 0);
++	gpu_put64("RBBM_SECVID_TSB_TRUSTED_BASE", REG_RBBM_SECVID_TSB_BASE, 0);
++	gpu_put("RBBM_SECVID_TSB_TRUSTED_SIZE", REG_RBBM_SECVID_TSB_SIZE, 0);
++	gpu_put("RBBM_GBIF_CLIENT_QOS_CNTL", REG_RBBM_GBIF_CLIENT_QOS, 0x2120212);
++	gpu_put("UCHE_GBIF_GX_CONFIG", REG_UCHE_GBIF_GX_CONFIG, 0x10240e0);
++	gpu_put("RBBM_PERFCTR_GPU_BUSY_MASKED", REG_RBBM_PERFCTR_BUSY, 0xffffffff);
++	gpu_put64("UCHE_TRAP_BASE", REG_UCHE_TRAP_BASE, UCHE_TRAP_BASE_VALUE);
++	gpu_put64("UCHE_WRITE_THRU_BASE", REG_UCHE_WRITE_THRU, UCHE_TRAP_BASE_VALUE);
++	gpu_put("UCHE_CACHE_WAYS", REG_UCHE_CACHE_WAYS, 1u << 23);
++	gpu_put("CP_AHB_CNTL", REG_CP_AHB_CNTL, 1);
++	gpu_put("RBBM_PERFCTR_CNTL", REG_RBBM_PERFCTR_CNTL, 1);
++	/* a6xx_set_ubwc_config for A730: highest bank bit 16 (hbb_lo 3), ubwc 4.0, macrotile mode 1 */
++	gpu_put("RB_NC_MODE_CNTL", REG_RB_NC_MODE_CNTL, 1u << 11 | 1u << 4 | 3u << 1);
++	gpu_put("TPL1_NC_MODE_CNTL", REG_TPL1_NC_MODE_CNTL, 3u << 1);
++	gpu_put("SP_NC_MODE_CNTL", REG_SP_NC_MODE_CNTL, 2u << 4 | 3u << 1);
++	gpu_put("GRAS_NC_MODE_CNTL", REG_GRAS_NC_MODE_CNTL, 3u << 5);
++	gpu_put("UCHE_MODE_CNTL", REG_UCHE_MODE_CNTL, 3u << 21);
++	gpu_put("RBBM_NC_MODE_CNTL", REG_RBBM_NC_MODE_CNTL, 1);
++	gpu_put("RBBM_INTERFACE_HANG_INT_CNTL", REG_RBBM_HANG_INT_CNTL, 1u << 30 | 0xcfffff);
++	gpu_put("UCHE_CLIENT_PF", REG_UCHE_CLIENT_PF, 1u << 7 | 1);
++	gpu_put("UCHE_CMDQ_CONFIG", REG_UCHE_CMDQ_CONFIG, 6u << 16 | 6u << 12 | 9u << 8 | 1u << 3 | 1u << 2 | 2u);
++	gpu_put("CP_APRIV_CNTL", REG_CP_APRIV_CNTL, 0x6f);
++	gpu_put("CP_BV_APRIV_CNTL", REG_CP_BV_APRIV_CNTL, 0xf);
++	gpu_put("CP_LPAC_APRIV_CNTL", REG_CP_LPAC_APRIV_CNTL, 0xf);
++	gpu_put("RB_CMP_DBG_ECO_CNTL", REG_RB_CMP_DBG_ECO_CNTL,
++	    rd(gpu_regs + GPU_WORD(REG_RB_CMP_DBG_ECO_CNTL)) | 1u << 11);
++	gpu_put64("CP_SQE_INSTR_BASE", REG_CP_SQE_INSTR_BASE, CORE_SQE_ADDRESS);
++	gpu_put64("CP_RB_BASE", REG_CP_RB_BASE, CORE_RING_ADDRESS);
++	gpu_put("CP_RB_CNTL", REG_CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	gpu_put64("CP_RB_RPTR_ADDR", REG_CP_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x80);
++	gpu_put64("CP_BV_RB_RPTR_ADDR", REG_CP_BV_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x100);
++
++	announce("start the 3D core's command processor (SQE)");
++	core_runs = true;
++	gpu_put("CP_SQE_CNTL", REG_CP_SQE_CNTL, 1);
++	delay(20000);
++	printf("NEGRONI ADRENO: 20 alive after the SQE start: RBBM_STATUS %#x, CP_HW_FAULT %#x, rptr %u\n",
++	    rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS)), rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)),
++	    rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR)));
++	if (space_faulted(&core_space)) {
++		return false;
++	}
++	/* a7xx_cp_init, without the power-up register list */
++	ring_command(CP_THREAD_CONTROL, 1);
++	ring(1u << 27);
++	ring_command(CP_ME_INIT, 7);
++	ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6);
++	ring(0x00000003);
++	ring(0x20000000);
++	ring(0x00000002);
++	ring(0);
++	ring(0);
++	ring(0);
++	if (!ring_run("initialize its command processor (CP_ME_INIT)")) {
++		return false;
++	}
++	printf("NEGRONI ADRENO: 20 THE 3D CORE TAKES COMMANDS\n");
++	return true;
++}
++
++static bool
++step_zap_and_secure(void)
++{
++	const uint8_t *mdt, *seg;
++	uint32_t mdt_size = 0, seg_size = 0;
++	uint64_t answer = ~0ull;
++	vm_offset_t page = 0;
++	volatile uint8_t *mem;
++
++	if (!core_runs) {
++		printf("NEGRONI ADRENO: 21 stop: the command processor does not run (step 20)\n");
++		return false;
++	}
++	mdt = negroni_fw_get("a730_zap.mdt", &mdt_size);
++	seg = negroni_fw_get("a730_zap.b02", &seg_size);
++	if (mdt == NULL || seg == NULL || mdt_size > PAGE_SIZE || seg_size > ZAP_MEMORY_SIZE) {
++		printf("NEGRONI ADRENO: 21 stop: zap files missing or too large\n");
++		return false;
++	}
++	announce("ask TrustZone to drop a zap shader an earlier run may have left");
++	scm("PAS shutdown (zap)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer);
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	memcpy((void *)page, mdt, mdt_size);
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);
++	answer = ~0ull;
++	if (scm("PAS init image (zap)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++		printf("NEGRONI ADRENO: 21 stop: TrustZone refuses the zap header (%#llx)\n", answer);
++		return false;
++	}
++	answer = ~0ull;
++	if (scm("PAS mem setup (zap)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY,
++	    ZAP_MEMORY_SIZE, &answer) != 0 || answer != 0) {
++		printf("NEGRONI ADRENO: 21 stop: TrustZone refuses the zap memory (%#llx)\n", answer);
++		return false;
++	}
++	announce("write the zap segment into 0x8b91a000 and ask TrustZone to authenticate and run it");
++	mem = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
++	for (uint32_t i = 0; i < ZAP_MEMORY_SIZE; i++) {
++		mem[i] = i < seg_size ? seg[i] : 0;
++	}
++	__asm__ volatile ("dsb sy");
++	answer = ~0ull;
++	if (scm("PAS auth and reset (zap)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_GPU, 0, 0,
++	    &answer) != 0 || answer != 0) {
++		printf("NEGRONI ADRENO: 21 stop: TrustZone does not authenticate the zap shader (%#llx)\n", answer);
++		return false;
++	}
++	printf("NEGRONI ADRENO: 21 TRUSTZONE RUNS THE ZAP SHADER\n");
++	ring_command(CP_SET_SECURE_MODE, 1);
++	ring(0);
++	if (!ring_run("leave secure mode")) {
++		return false;
++	}
++	core_unsecure = true;
++	ring_command(CP_MEM_WRITE, 3);
++	ring(CORE_SCRATCH_ADDRESS);
++	ring(0);
++	ring(0x600dc0de);
++	if (!ring_run("write a word into our page")) {
++		return false;
++	}
++	to_memory(core_scratch.memory, 64);
++	uint32_t word = *(volatile uint32_t *)core_scratch.memory;
++	printf("NEGRONI ADRENO: 21 scratch reads %#x: %s\n", word,
++	    word == 0x600dc0de ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what it was told");
++	return word == 0x600dc0de;
++}
++
++/* The 2D engine fills rectangles (Mesa fd6_clear_surface), sysmem, BGRA linear. */
++#define REG_GRAS_2D_BLIT_CNTL   0x8400
++#define REG_GRAS_2D_DST_TL      0x8405
++#define REG_GRAS_2D_DST_BR      0x8406
++#define REG_RB_2D_BLIT_CNTL     0x8c00
++#define REG_RB_2D_PIXEL_CNTL    0x8c01
++#define REG_RB_2D_DST_INFO      0x8c17
++#define REG_RB_2D_DST           0x8c18
++#define REG_RB_2D_DST_PITCH     0x8c1a
++#define REG_RB_2D_SRC_SOLID_C0  0x8c2c
++#define REG_SP_2D_DST_FORMAT    0xacc0
++#define FORMAT_8888             0x30
++#define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24)
++#define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)
++#define TARGET_WIDTH            1080
++#define TARGET_HEIGHT           2400
++#define TARGET_ROW              4352
++
++static void
++ring_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
++{
++	ring_register(REG_GRAS_2D_DST_TL, top << 16);
++	ring_register(REG_GRAS_2D_DST_BR, (TARGET_WIDTH - 1) | (bottom - 1) << 16);
++	ring_register(REG_RB_2D_SRC_SOLID_C0, r);
++	ring_register(REG_RB_2D_SRC_SOLID_C0 + 1, g);
++	ring_register(REG_RB_2D_SRC_SOLID_C0 + 2, b);
++	ring_register(REG_RB_2D_SRC_SOLID_C0 + 3, 255);
++	ring_register(REG_RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(REG_GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(REG_SP_2D_DST_FORMAT, 1 | FORMAT_8888 << 3 | 0xfu << 12);
++	ring_register(REG_RB_2D_PIXEL_CNTL, 0);
++	ring_register(REG_RB_2D_DST_INFO, DST_BGRA_LINEAR);
++	ring_register(REG_RB_2D_DST, CORE_TARGET_ADDRESS);
++	ring_register(REG_RB_2D_DST + 1, 0);
++	ring_register(REG_RB_2D_DST_PITCH, TARGET_ROW >> 6);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	ring_command(CP_BLIT, 1);
++	ring(3);
++}
++
++static bool
++step_frame(void)
++{
++	if (!core_unsecure) {
++		printf("NEGRONI ADRENO: 22 stop: the 3D core is still secure (step 21)\n");
++		return false;
++	}
++	announce("make 10 MB for a picture and have the 2D engine fill three bands");
++	if (!core_block(&core_target, "picture", CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, 0)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < core_space.table_count; i++) {
++		to_memory((vm_offset_t)core_space.tables[i].table, 4096);
++	}
++	ring_fill(0, 800, 255, 128, 0);
++	ring_fill(800, 1600, 255, 255, 255);
++	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
++	ring_command(CP_EVENT_WRITE7, 1);
++	ring(EVENT_CCU_FLUSH_COLOR);
++	ring_command(CP_EVENT_WRITE7, 1);
++	ring(EVENT_CACHE_CLEAN);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	if (!ring_run("fill a picture")) {
++		return false;
++	}
++	to_memory(core_target.memory, core_target.size);
++	const volatile uint8_t *px = (const volatile uint8_t *)core_target.memory;
++	uint32_t mid = 1200 * TARGET_ROW + 2160, last = 2399 * TARGET_ROW + 4316;
++	printf("NEGRONI ADRENO: 22 pixels (B G R A): top %02x %02x %02x %02x (want 00 80 ff ff), middle %02x %02x %02x %02x "
++	    "(want ff ff ff ff), bottom %02x %02x %02x %02x (want ff 80 00 ff)\n", px[0], px[1], px[2], px[3], px[mid],
++	    px[mid + 1], px[mid + 2], px[mid + 3], px[last], px[last + 1], px[last + 2], px[last + 3]);
++	bool ok = px[1] == 0x80 && px[2] == 0xff && px[mid] == 0xff && px[last] == 0xff && px[last + 2] == 0;
++	printf("NEGRONI ADRENO: 22 %s\n", ok ? "THE GPU DREW A PICTURE" : "the picture is not what was drawn");
++	return ok;
++}
++
+ static bool (*const steps[])(void) = {
+ 	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
+ 	step_rscc, step_smmu, step_smmu_context, step_gmu_memory, step_trustzone,
+ 	step_zap_signature, step_gmu_space, step_gmu_firmware, step_gmu_start, step_hfi_start,
+-	step_hfi_messages,
++	step_hfi_messages, step_core_power, step_core_space, step_core_start, step_zap_and_secure, step_frame,
+ };
+ 
+ void
+@@ -1455,7 +1934,7 @@ negroni_adreno_init(void)
+ 		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU STOP %u", step);
+ 		negroni_gpu_badge_color = 0x00c00000;
+ 	} else if (gmu_counts) {
+-		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU ON %u", last);
++		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), last >= 22 ? "GPU DRAWS %u" : "GPU ON %u", last);
+ 		negroni_gpu_badge_color = 0x0000a000;
+ 	} else {
+ 		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU %u OK", last);
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index bb075ff..e1b5048 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4202,6 +4202,12 @@ bad_px_sa:
+ 	}
+ 
+ bad:
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/* NEGRONI: a refused spawn is otherwise silent (app extensions through xpcproxy). */
++	if (error != 0 && imgp != NULL && imgp->ip_strings != NULL) {
++		printf("spawn FAIL %s error %d\n", imgp->ip_strings + strlen(EXECUTABLE_KEY), error);
++	}
++#endif
+ 
+ 	if (error == 0) {
+ 		/* reset delay idle sleep status if set */
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 914c59d..f0be3ea 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1848,6 +1848,12 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/* NEGRONI: why helpers like xpcproxy end (signals are reported as CRASH elsewhere). */
++	if (rv != 0 && (rv & 0x7f) == 0) {
++		printf("exit %s[%d] status %d\n", p->p_comm, proc_getpid(p), (rv >> 8) & 0xff);
++	}
++#endif
+ 
+ 	/*
+ 	 * Generate a corefile/crashlog if:

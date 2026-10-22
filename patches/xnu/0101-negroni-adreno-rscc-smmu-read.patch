@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index ddfbe72..70a917f 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -14,6 +14,9 @@
+  *              GPUCC: GMU clock 200 MHz and hub 150 MHz from the GPLL0 300 MHz tap,
+  *              then the CX clocks (AHB, CXO, hub AON, hub CX int, CX GMU, SMMU vote)
+  *   6  reads   the GMU's first words: the always-on counter must count
++ *   7  reads   the GMU's RPMh channel (RSCC, gmu "rscc" 0x3d50000): status, sequencer, TCS0
++ *   8  reads   the adreno SMMU (0x3da0000, MMU-500): ID registers, stream match table, context kinds
++ *   9  reads   SMMU translation context 0 (the GPU's): SCTLR, TTBR0, TCR, FSR
+  * negroniadreno_pause=MS waits after each announcement (default 500), so the
+  * persistent log has the line before a silent reset.
+  *
+@@ -75,6 +78,33 @@ void negroni_adreno_init(void);
+ #define GMU_AO_COUNTER_L        0x1f888
+ #define GMU_CM3_SYSRESET        0x1f800
+ #define GMU_CM3_FW_INIT_RESULT  0x1f81c
++#define GMU_RSCC_CONTROL_ACK    0x23b08
++
++/* RSCC (a6xx_gmu.xml domain A6XX_RSCC, dword offsets; A730 keeps the pre-A740 layout) */
++#define RSCC_PHYS               0x03d50000UL
++#define RSCC_SIZE               0x10000UL
++#define RSCC_RSC_STATUS0_DRV0   (4 * 0x004)
++#define RSCC_PDC_SLAVE_ID_DRV0  (4 * 0x00b)
++#define RSCC_SEQ_BUSY_DRV0      (4 * 0x101)
++#define RSCC_SEQ_MEM_0_DRV0     (4 * 0x180)
++#define RSCC_TCS0_DRV0_STATUS   (4 * 0x346)
++
++/* adreno SMMU (arm-smmu.h); streams: GPU 0 and 1, GMU 5 (mask 0x400) */
++#define SMMU_PHYS               0x03da0000UL
++#define SMMU_SIZE               0x40000UL
++#define SMMU_SCR0               0x000
++#define SMMU_IDR0               0x020           /* [7:0] stream match registers */
++#define SMMU_IDR1               0x024           /* [31] 64K pages, [30:28] log2(pages)-1, [7:0] contexts */
++#define SMMU_IDR2               0x028
++#define SMMU_IDR7               0x03c
++#define SMMU_SGFSR              0x048
++#define SMMU_SMR(n)             (0x800 + 4 * (n))
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
++#define SMMU_CBAR(n)            (4 * (n))       /* in the second page */
++#define SMMU_CB_SCTLR           0x00
++#define SMMU_CB_TTBR0           0x20
++#define SMMU_CB_TCR             0x30
++#define SMMU_CB_FSR             0x58
+ 
+ static uint32_t pause_ms = 500;
+ static uint32_t step;
+@@ -86,7 +116,8 @@ static uint32_t step;
+ char negroni_gpu_badge[24] = "GPU OFF";
+ uint32_t negroni_gpu_badge_color = 0x00606060;
+ static bool gmu_counts;
+-static vm_offset_t gcc, gpucc, gmu;
++static vm_offset_t gcc, gpucc, gmu, rscc, smmu;
++static uint32_t smmu_page, smmu_pages, smmu_contexts, smmu_matches;
+ 
+ /* Plain 32-bit loads and stores; the hypervisor's trap emulation copes with no other form. */
+ static uint32_t __attribute__((noinline))
+@@ -120,6 +151,15 @@ put(vm_offset_t base, const char *name, uint32_t offset, uint32_t value)
+ 	printf("NEGRONI ADRENO: %u %s %#x -> %#x (reads %#x)\n", step, name, was, value, rd(base + offset));
+ }
+ 
++static uint32_t
++get(vm_offset_t base, const char *name, uint32_t offset)
++{
++	uint32_t v = rd(base + offset);
++
++	printf("NEGRONI ADRENO: %u %s [%#x] = %#x\n", step, name, offset, v);
++	return v;
++}
++
+ /* Wait up to `ms` for (reg & mask) == want. */
+ static bool
+ wait_for(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t ms)
+@@ -329,8 +369,100 @@ step_gmu_first_words(void)
+ 	return true;
+ }
+ 
++static bool
++cx_ready(void)
++{
++	if (!cx_is_on() || (rd(gpucc + GPUCC_CX_GMU_CBCR) & CBCR_OFF)) {
++		printf("NEGRONI ADRENO: %u stop: CX or the GMU clock is off (steps 4, 5)\n", step);
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_rscc(void)
++{
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("read the GMU's RPMh channel (RSCC 0x3d50000)");
++	get(rscc, "RSC_STATUS0_DRV0", RSCC_RSC_STATUS0_DRV0);
++	get(rscc, "PDC_SLAVE_ID_DRV0", RSCC_PDC_SLAVE_ID_DRV0);
++	get(rscc, "SEQ_BUSY_DRV0", RSCC_SEQ_BUSY_DRV0);
++	get(rscc, "SEQ_MEM_0_DRV0", RSCC_SEQ_MEM_0_DRV0);
++	get(rscc, "TCS0_DRV0_STATUS", RSCC_TCS0_DRV0_STATUS);
++	printf("NEGRONI ADRENO: 7 GMU_RSCC_CONTROL_ACK = %#x\n", rd(gmu + GMU_REG(GMU_RSCC_CONTROL_ACK)));
++	return true;
++}
++
++/* The SMMU's layout from its ID registers; false if it does not match the 0x40000 the device tree gives. */
++static bool
++smmu_layout(void)
++{
++	uint32_t idr0 = get(smmu, "SMMU_IDR0", SMMU_IDR0), idr1 = get(smmu, "SMMU_IDR1", SMMU_IDR1);
++
++	smmu_page = (idr1 >> 31) ? 0x10000 : 0x1000;
++	smmu_pages = 2u << ((idr1 >> 28) & 7);
++	smmu_contexts = idr1 & 0xff;
++	smmu_matches = idr0 & 0xff;
++	printf("NEGRONI ADRENO: %u SMMU: %u stream matches, %u contexts, %u pages of %#x\n", step,
++	    smmu_matches, smmu_contexts, smmu_pages, smmu_page);
++	if (2 * smmu_pages * smmu_page > SMMU_SIZE) {
++		printf("NEGRONI ADRENO: %u stop: layout %#x exceeds the %#lx mapped\n", step,
++		    2 * smmu_pages * smmu_page, SMMU_SIZE);
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_smmu(void)
++{
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("read the adreno SMMU ID registers (0x3da0000; the hypervisor emulates the global space)");
++	if (!smmu_layout()) {
++		return false;
++	}
++	get(smmu, "SMMU_IDR2", SMMU_IDR2);
++	get(smmu, "SMMU_IDR7", SMMU_IDR7);
++	get(smmu, "SMMU_SCR0", SMMU_SCR0);
++	get(smmu, "SMMU_SGFSR", SMMU_SGFSR);
++	announce("read the SMMU stream match table and context kinds");
++	for (uint32_t i = 0; i < smmu_matches && i < 16; i++) {
++		uint32_t smr = rd(smmu + SMMU_SMR(i)), s2cr = rd(smmu + SMMU_S2CR(i));
++		printf("NEGRONI ADRENO: 8 SMR%u = %#x (%s sid %#x mask %#x)  S2CR%u = %#x (type %u cb %u)\n", i, smr,
++		    (smr >> 31) ? "valid" : "-", smr & 0x7fff, (smr >> 16) & 0x7fff, i, s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++	}
++	for (uint32_t i = 0; i < smmu_contexts && i < 16; i++) {
++		printf("NEGRONI ADRENO: 8 CBAR%u = %#x\n", i, rd(smmu + smmu_page + SMMU_CBAR(i)));
++	}
++	return true;
++}
++
++/* Context 0 only: the one Linux and the vendor driver give the GPU; others may belong to TrustZone. */
++static bool
++step_smmu_context(void)
++{
++	vm_offset_t cb;
++
++	if (!cx_ready()) {
++		return false;
++	}
++	announce("read SMMU translation context 0 (hardware registers)");
++	if (!smmu_layout()) {
++		return false;
++	}
++	cb = smmu + smmu_pages * smmu_page;
++	printf("NEGRONI ADRENO: 9 CB0 SCTLR %#x TTBR0 %#x:%#x TCR %#x FSR %#x\n", rd(cb + SMMU_CB_SCTLR),
++	    rd(cb + SMMU_CB_TTBR0 + 4), rd(cb + SMMU_CB_TTBR0), rd(cb + SMMU_CB_TCR), rd(cb + SMMU_CB_FSR));
++	return true;
++}
++
+ static bool (*const steps[])(void) = {
+ 	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
++	step_rscc, step_smmu, step_smmu_context,
+ };
+ 
+ void
+@@ -348,6 +480,8 @@ negroni_adreno_init(void)
+ 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
+ 	gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
+ 	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
++	rscc = ml_io_map(RSCC_PHYS, RSCC_SIZE);
++	smmu = ml_io_map(SMMU_PHYS, SMMU_SIZE);
+ 	bool failed = false;
+ 	for (step = 1; step <= last; step++) {
+ 		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU %u", step);
+@@ -366,7 +500,7 @@ negroni_adreno_init(void)
+ 		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU STOP %u", step);
+ 		negroni_gpu_badge_color = 0x00c00000;
+ 	} else if (gmu_counts) {
+-		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU ON");
++		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU ON %u", last);
+ 		negroni_gpu_badge_color = 0x0000a000;
+ 	} else {
+ 		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU %u OK", last);

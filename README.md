@@ -34,7 +34,7 @@ scripts/
   build-payload.py  out/esp.img: NEGRONIESP payload (UniXNU config + DarwinBoot inputs)
   build-bootimg.py  out/boot_a.img: Mu-Silicium + ios-sweet shim + payload
   flash.py          flash out/boot_a.img with fastboot
-patches/            changes to external trees
+patches/            changes to external trees; patches/xnu: the kernel patches
 inputs/             kernel Mach-O, ADT (ignored)
 out/                build products (ignored)
 ```
@@ -58,6 +58,18 @@ scripts/build-payload.py                # boot args from board.toml
 scripts/build-bootimg.py
 scripts/flash.py --reboot               # phone in fastboot
 ```
+
+## Root filesystem
+
+The iOS 16.7.16 root is an HFS+ image built in `ios-sweet` (`ios16-root.img`, converted to a
+sparse image with `img2simg`). It goes into the `userdata` partition, in 512 MiB chunks:
+
+```sh
+fastboot -S 512M flash userdata ios16-root.simg
+```
+
+This replaces whatever is on userdata. The first boot of a fresh root spends a while on the
+Apple logo (data migration); leave the phone plugged in.
 
 A one-off boot arg without editing the board file:
 

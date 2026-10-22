@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
+index 72189fe..1fcc651 100644
+--- a/bsd/dev/negroni_wifi.c
++++ b/bsd/dev/negroni_wifi.c
+@@ -6,7 +6,8 @@
+  * Boot arg negroniwifi=N performs steps 1..N (default 0: nothing).
+  *   1  reads   GCC PCIe0: the GDSC and the branches (AUX, CFG AHB, MSTR/SLV AXI, PIPE)
+  *   2  reads   TLMM pins: WLAN_EN 80, BT_EN 81, SW_CTRL 82, PERST 94, WAKE 96, XO_CLK 204
+- *   3  reads   cmd-db: the RPMh addresses of the chip's rails (vendor DT qcom,cnss-qca6490:
++ *   3  reads   cmd-db (aop_cmd_db_mem 0x80860000, plain memory; no RSC access): the RPMh
++ *              addresses of the chip's rails (vendor DT qcom,cnss-qca6490:
+  *              aon smpe2 1.012 V, dig smpb11 0.966 V, io smpb10 1.8 V, rfa1 smpc1 1.9 V,
+  *              rfa2 smpb12 1.35 V)
+  *   4  reads   PCIe0 PARF (0x1c00000) and the PHY (0x1c06000), only if CFG AHB runs: what ABL left
+@@ -18,9 +19,9 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
++#include <sys/errno.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern int negroni_rpmh_lookup(const char *res, uint32_t *address);
+ void negroni_wifi_init(void);
+ extern uint32_t negroni_probe_wifi;
+ 
+@@ -108,16 +109,65 @@ step_pins(void)
+ 	return true;
+ }
+ 
++/* cmd-db (Linux drivers/soc/qcom/cmd-db.c): header, 8 slave headers, then entries of 24 bytes. */
++#define CMD_DB_PHYS             0x80860000UL
++#define CMD_DB_SIZE             0x20000u
++#define CMD_DB_HEADER           (4 + 4 + 8 * 16 + 4 + 4)        /* version, magic, slaves, checksum, reserved */
++
++static vm_offset_t cmd_db;
++
++static uint32_t
++db32(uint32_t off)
++{
++	return off + 4 <= CMD_DB_SIZE ? rd(cmd_db + off) : 0;
++}
++
++static uint16_t
++db16(uint32_t off)
++{
++	return (uint16_t)(db32(off & ~3u) >> (8 * (off & 2)));
++}
++
++static int
++cmd_db_lookup(const char *name, uint32_t *address)
++{
++	uint32_t key[2] = { 0, 0 };
++
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	for (unsigned s = 0; s < 8; s++) {
++		uint32_t h = 8 + 16 * s;
++		uint32_t entries = CMD_DB_HEADER + db16(h + 2), count = db16(h + 6);
++		if (db16(h) == 0 || count > 1024 || entries + count * 24 > CMD_DB_SIZE) {
++			continue;
++		}
++		for (uint32_t j = 0; j < count; j++) {
++			uint32_t e = entries + 24 * j;
++			if (db32(e) == key[0] && db32(e + 4) == key[1]) {
++				*address = db32(e + 16);
++				return 0;
++			}
++		}
++	}
++	return ENOENT;
++}
++
+ static bool
+ step_rails(void)
+ {
+ 	static const char *const rails[] = { "smpe2", "smpb11", "smpb10", "smpc1", "smpb12" };
+ 	unsigned found = 0;
+ 
+-	announce("look the Wi-Fi rails up in cmd-db (read only)");
++	announce("look the Wi-Fi rails up in cmd-db at 0x80860000 (read only)");
++	cmd_db = ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
++	if (!cmd_db || db32(4) != 0x0c0330db) {
++		printf("NEGRONI WIFI: 3 stop: no cmd-db at %#lx (magic %#x)\n", CMD_DB_PHYS, cmd_db ? db32(4) : 0);
++		return false;
++	}
+ 	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+ 		uint32_t address = 0;
+-		int error = negroni_rpmh_lookup(rails[i], &address);
++		int error = cmd_db_lookup(rails[i], &address);
+ 		printf("NEGRONI WIFI: 3 %s -> %s %#x\n", rails[i], error ? "error" : "address", error ? (uint32_t)error : address);
+ 		found += !error;
+ 	}

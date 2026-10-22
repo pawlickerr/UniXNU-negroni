@@ -1,0 +1,1285 @@
+diff --git a/bsd/dev/negroni_touch.c b/bsd/dev/negroni_touch.c
+index bdb1eca..f2d8d24 100644
+--- a/bsd/dev/negroni_touch.c
++++ b/bsd/dev/negroni_touch.c
+@@ -1,9 +1,11 @@
+ /*
+- * NEGRONI SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
+- * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L11C through negroni_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * NEGRONI Synaptics S3908 (TouchComm, I2C 0x4b) touch.
++ * QUP0 SE4 has its FIFO disabled (GPI only, DMA block secure-locked), so the
++ * bus is open-drain GPIO16/17 I2C, the same code as Mu's NegroniTouchDxe
++ * (bsd/dev/negroni_touch/ = ios-sweet drivers/negroni-touch). Mu powers the
++ * panel (L6C, L3C, 1.8 V switch) and leaves it on; this thread polls ATTN
++ * (GPIO21, active low) every 10 ms and reports fingers to NegroniHIDTouch.
++ * Call once after the scheduler is running.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -15,621 +17,187 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
++#include "negroni_touch/tlmm_i2c.h"
++#include "negroni_touch/syna_tcm.h"
++
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-/* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+-extern int negroni_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void IOSleep(unsigned int milliseconds);
+ extern void negroni_hid_touch(int finger, int down, int x, int y);
+ void negroni_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
+-#define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+-#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+-#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+-#define TOUCH_MAX        10u
+-#define TOUCH_GOODIX     1
+-#define TOUCH_FTS        2
+-/* GT9896 is Yellowstone in Xiaomi negroni-r-oss, not the Berlin protocol. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
+-#define GOODIX_POINT_LEN 8u
+-
+-#define SE_STATUS       0x040u
+-#define SE_MCLK         0x048u
+-#define SE_FW           0x068u
+-#define SE_CLK_SEL      0x07cu
+-#define SE_DMA          0x258u
+-#define SE_TX_LEN       0x26cu
+-#define SE_RX_LEN       0x270u
+-#define SE_SCL          0x278u
+-#define SE_CMD          0x600u
+-#define SE_CTRL         0x604u
+-#define SE_IRQ          0x610u
+-#define SE_IRQ_EN       0x614u
+-#define SE_IRQ_CLR      0x618u
+-#define SE_TX           0x700u
+-#define SE_RX           0x780u
+-#define SE_TX_COUNT     0x800u
+-#define SE_RX_COUNT     0x804u
+-#define SE_HW_TX        0xe24u
+-#define SE_HW_RX        0xe28u
+-#define SE_TX_WM        0x80cu
+-#define SE_RX_WM_IRQ    (1u << 26)
+-#define SE_RX_LAST      (1u << 27)
+-#define SE_TX_WM_IRQ    (1u << 30)
+-#define SE_DONE         (1u << 0)
+-#define SE_NACK         (1u << 10)
+-#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
+-                         (1u << 13) | (3u << 24) | (3u << 28))
+-#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
+-/* geni_se_config_packing(8, 4, true, true, true): start bits 7/15/23/31,
+- * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
+-#define SE_PACK0        0x0007f8feu
+-#define SE_PACK1        0x000ffefeu
++/* TLMM pages of GPIO16..23: SDA 16, SCL 17, reset 20, ATTN 21 */
++#define TOUCH_PINS_PA   (TLMM_BASE + TLMM_CTL(NT_PIN_I2C_SDA))
++#define TOUCH_PINS_LEN  0x8000u
++#define TOUCH_PIN(n)    ((uint32_t)((n) - NT_PIN_I2C_SDA) * 0x1000u)
++#define S3908_ADDR      0x4b
++/* panel (5760x12864, touchpanel,panel-coords) to display pixels */
++#define TOUCH_W         1080
++#define TOUCH_H         2412
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
+-	bool started, dead, probing;
+-	int kind, irq_hint;
+-	uint32_t irq_status, irq_last, active;
+-	unsigned sent, got;
+-	int x[TOUCH_MAX], y[TOUCH_MAX];
++	bool started;
++	int log;
++	vm_offset_t pins;
++	struct tlmm_i2c line;
++	struct gpio_i2c bus;
++	struct tcm tcm;
++	uint32_t active;
++	int x[TCM_MAX_OBJECTS], y[TCM_MAX_OBJECTS];
+ } st;
+-static int touch_sleep_chan;
+-
+-static uint32_t
+-touch_rd(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+ 
+ static void
+-touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++touch_udelay(unsigned us)
+ {
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = val;
+-	__asm__ volatile("dsb osh" ::: "memory");
+-}
+-
+-static void
+-touch_wait(unsigned ms)
+-{
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
+-
+-static bool
+-touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+-{
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (!(touch_rd(base, off) & mask)) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
+-}
+-
+-static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+-{
+-	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
+-	if (out) {
+-		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+-	}
+-	cfg &= ~0x3ffu;
+-	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
+-}
+-
+-static bool
+-touch_clocks(void)
+-{
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+-	printf("NEGRONI TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
+-	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("NEGRONI TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+-			return false;
+-		}
+-	} else {
+-		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+-		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
+-			printf("NEGRONI TOUCH: RCG update timeout\n");
+-			return false;
+-		}
+-	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("NEGRONI TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
+-		}
+-	}
+-	return true;
++	delay((int)us);
+ }
+ 
+-/* Called only for a transfer started by this driver, including a stretched TX. */
+ static void
+-touch_abort(void)
++touch_wait_1ms(void)
+ {
+-	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
+-	bool done = false;
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
+-			done = true;
+-			break;
+-		}
+-		delay(1);
+-	}
+-	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true;
+-		printf("NEGRONI TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+-		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
+-	}
+-	/* Bound drain even if the hardware reports an impossible FIFO count. */
+-	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+-		(void)touch_rd(st.se, SE_RX);
+-	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+-		st.dead = true;
+-		printf("NEGRONI TOUCH: TX FIFO not empty after abort; stopping\n");
+-	}
++	IOSleep(1);
+ }
+ 
+-/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
+-static uint32_t
+-touch_irq(void)
+-{
+-	st.irq_last = touch_rd(st.se, SE_IRQ);
+-	st.irq_status |= st.irq_last;
+-	return st.irq_last;
+-}
+-
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
+ static int
+-touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++touch_attn(void)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+-		return EIO;
+-	}
+-	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
+-		return EBUSY;
+-	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
+-	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+-	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+-	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+-	int err = ETIMEDOUT;
+-	for (unsigned i = 0; i < 20000; ++i) {
+-		uint32_t irq = touch_irq();
+-		if (irq & SE_ERRORS) {
+-			err = (irq & SE_NACK) ? ENXIO : EIO;
+-			/* A completed NACK is normal during address probing. Aborting an
+-			 * idle sequencer may never produce ABORT_DONE. Wait for completion
+-			 * and leave a clean idle engine available for the other IC. */
+-			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+-				delay(1);
+-				irq = touch_irq();
+-			}
+-			if ((irq & SE_DONE) && !(touch_rd(st.se, SE_STATUS) & 1u) &&
+-			    !(touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
+-			    !(touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-				touch_wr(st.se, SE_IRQ_CLR, irq);
+-				return err;
+-			}
+-			break;
+-		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
+-			}
+-			touch_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			touch_wr(st.se, SE_TX_WM, 0);
+-		}
+-		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+-		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
+-			err = EIO;
+-			break;
+-		}
+-		while (count--) {
+-			uint32_t word = touch_rd(st.se, SE_RX);
+-			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
+-				rx[st.got++] = (uint8_t)(word >> (8u * j));
+-			}
+-		}
+-		/* DONE is checked after draining RX, so final short words aren't lost. */
+-		if (irq & SE_DONE) {
+-			/* Re-sample after the final drain; a late error must beat DONE. */
+-			irq = touch_irq();
+-			if (irq & SE_ERRORS) {
+-				continue;
+-			}
+-			touch_wr(st.se, SE_IRQ_CLR, irq);
+-			if (st.got == nr && st.sent == nt) {
+-				return 0;
+-			}
+-			err = EIO;
+-			break;
+-		}
+-		/* Preserve DONE/errors if they arrive during this iteration. */
+-		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
+-		delay(1);
+-	}
+-	touch_abort();
+-	return err;
++	return (int)(*(volatile uint32_t *)(st.pins + TOUCH_PIN(NT_PIN_IRQ) + 4) & TLMM_IN);
+ }
+ 
+ static int
+-touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++touch_i2c_read(void *ctx, uint8_t *buf, uint32_t len)
+ {
+-	st.irq_status = st.irq_last = 0;
+-	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+-	if (st.probing) {
+-		printf("NEGRONI TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
+-	}
+-	return err;
++	return gpio_i2c_read(ctx, S3908_ADDR, buf, len);
+ }
+ 
+ static int
+-touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++touch_i2c_write(void *ctx, const uint8_t *buf, uint32_t len)
+ {
+-	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+-	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+-	    NULL, 0, true);
+-	if (err) {
+-		return err;
+-	}
+-	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
+-	return touch_msg(addr, NULL, 0, buf, len, false);
++	return gpio_i2c_write(ctx, S3908_ADDR, buf, len);
+ }
+ 
+-static int
+-touch_goodix_ack(void)
++static void
++touch_report(void)
+ {
+-	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
+-}
++	uint32_t mask = 0;
+ 
+-/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+- * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+- * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
+-touch_probe_info(uint16_t reg, uint8_t *buf)
+-{
+-	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
+-	printf("NEGRONI TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+-	    reg, err, st.irq_last, st.irq_status);
+-	if (!err) {
+-		for (unsigned off = 0; off < 32; off += 16) {
+-			char line[49];
+-			for (unsigned j = 0; j < 16; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
++	for (unsigned id = 0; id < TCM_MAX_OBJECTS; ++id) {
++		const struct tcm_object *o = &st.tcm.obj[id];
++		uint32_t bit = 1u << id;
++
++		if (o->status == 0) {
++			continue;
++		}
++		int x = (int)((uint64_t)MIN(o->x, TCM_PANEL_MAX_X - 1) * TOUCH_W / TCM_PANEL_MAX_X);
++		int y = (int)((uint64_t)MIN(o->y, TCM_PANEL_MAX_Y - 1) * TOUCH_H / TCM_PANEL_MAX_Y);
++		mask |= bit;
++		if (!(st.active & bit) || x != st.x[id] || y != st.y[id]) {
++			negroni_hid_touch((int)id, 1, x, y);
++			if (st.log && !(st.active & bit)) {
++				printf("NEGRONI TOUCH: finger %u down %d,%d\n", id, x, y);
+ 			}
+-			printf("NEGRONI TOUCH: probe raw %#x: %s\n", reg + off, line);
+ 		}
++		st.x[id] = x;
++		st.y[id] = y;
+ 	}
+-	return err;
+-}
+-
+-static unsigned
+-touch_be16(const uint8_t *p)
+-{
+-	return ((unsigned)p[0] << 8) | p[1];
+-}
+-
+-static bool
+-touch_checksum(const uint8_t *buf, unsigned len)
+-{
+-	if (len < 2) {
+-		return false;
+-	}
+-	unsigned sum = 0;
+-	for (unsigned i = 0; i + 2 < len; ++i) {
+-		sum += buf[i];
+-	}
+-	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+-}
+-
+-static void
+-touch_report(uint32_t mask, const int *x, const int *y)
+-{
+-	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++	for (unsigned id = 0; id < TCM_MAX_OBJECTS; ++id) {
+ 		uint32_t bit = 1u << id;
+-		if (mask & bit) {
+-			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
+-				negroni_hid_touch((int)id, 1, x[id], y[id]);
+-			}
+-			st.x[id] = x[id];
+-			st.y[id] = y[id];
+-		} else if (st.active & bit) {
++		if ((st.active & bit) && !(mask & bit)) {
+ 			negroni_hid_touch((int)id, 0, st.x[id], st.y[id]);
+ 		}
+ 	}
+ 	st.active = mask;
+ }
+ 
+-static int
+-touch_goodix(void)
++static void
++touch_release_all(void)
+ {
+-	uint8_t buf[90];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
+-	if (err) {
+-		return err;
+-	}
+-	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
+-		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
+-	}
+-	unsigned n = buf[2] & 15u;
+-	if (n > TOUCH_MAX) {
+-		(void)touch_goodix_ack();
+-		return EIO;
+-	}
+-	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+-		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+-		if (err) {
+-			return err;
+-		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-	}
+-	for (unsigned i = 0; i < n; ++i) {
+-		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
++	for (unsigned id = 0; id < TCM_MAX_OBJECTS; ++id) {
++		st.tcm.obj[id].status = 0;
+ 	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
+-	}
+-	return err;
++	touch_report();
+ }
+ 
++/* Drain pending messages (identify after reset, stale reports), then read the report config. */
+ static int
+-touch_focaltech(void)
++touch_setup(void)
+ {
+-	uint8_t buf[63];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
+-	if (err) {
+-		return err;
+-	}
+-	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		const uint8_t *p = buf + 3u + 6u * i;
+-		unsigned id = p[2] >> 4, event = p[0] >> 6;
+-		if (id >= TOUCH_MAX) {
+-			break; /* vendor's unused-record sentinel */
+-		}
+-		if (seen & (1u << id)) {
+-			return EIO;
+-		}
+-		seen |= 1u << id;
+-		if (event == 1u) {
+-			continue; /* UP record */
+-		}
+-		if (event == 3u) {
+-			return EIO;
+-		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-		++active;
+-	}
+-	if (active != n) {
+-		return EIO;
+-	}
+-	touch_report(mask, x, y);
+-	return 0;
+-}
++	int rc = 1;
+ 
+-static bool
+-touch_se_init(void)
+-{
+-	uint32_t fw = touch_rd(st.se, SE_FW);
+-	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("NEGRONI TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+-	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+-	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+-	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("NEGRONI TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+-		return false;
+-	}
+-	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("NEGRONI TOUCH: SE7 already busy; probes skipped\n");
+-		return false;
+-	}
+-	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+-	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
+-	touch_wr(st.se, 0x644, 0);
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, 0x648, 0xffffffffu);
+-	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+-	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+-	touch_wr(st.se, 0x254, 0);
+-	touch_wr(st.se, 0x260, SE_PACK0);
+-	touch_wr(st.se, 0x264, SE_PACK1);
+-	touch_wr(st.se, 0x284, SE_PACK0);
+-	touch_wr(st.se, 0x288, SE_PACK1);
+-	touch_wr(st.se, SE_TX_WM, 0);
+-	touch_wr(st.se, 0x810, 0);
+-	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+-	printf("NEGRONI TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+-	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+-	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
+-	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x254) != 0) {
+-		printf("NEGRONI TOUCH: packing readback mismatch; probes skipped\n");
+-		return false;
+-	}
+-	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
+-	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-		printf("NEGRONI TOUCH: inherited FIFO data; probes skipped\n");
+-		return false;
++	for (int i = 0; i < 50 && !touch_attn(); i++) {
++		rc = tcm_read_message(&st.tcm);
++		if (rc < 0) {
++			break;
++		}
+ 	}
+-	return true;
++	printf("NEGRONI TOUCH: drain rc=%d code=%#x hdr %02x %02x %02x %02x bus=%d attn=%d\n",
++	    rc, st.tcm.code, st.tcm.header[0], st.tcm.header[1], st.tcm.header[2],
++	    st.tcm.header[3], st.tcm.transport_error, touch_attn());
++	rc = tcm_get_report_config(&st.tcm, touch_wait_1ms);
++	printf("NEGRONI TOUCH: report config rc=%d len=%u bus=%d\n",
++	    rc, st.tcm.config_len, st.tcm.transport_error);
++	return rc;
+ }
+ 
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+-	unsigned delay_s = 45;
++	unsigned delay_s = 5;
+ 	(void)arg;
+ 	(void)result;
+-	/*
+-	 * Start late (boot-arg negronitouchdelay, seconds): if the bus access
+-	 * below hangs the SoC, the persistent log and the GUI got there first.
+-	 */
++
+ 	(void)PE_parse_boot_argn("negronitouchdelay", &delay_s, sizeof(delay_s));
+-	printf("NEGRONI TOUCH: starting in %u s\n", delay_s);
+-	touch_wait(delay_s * 1000u);
+-	printf("NEGRONI TOUCH: mapping GCC/TLMM/SE7\n");
+-	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
+-		printf("NEGRONI TOUCH: MMIO mapping failed\n");
++	printf("NEGRONI TOUCH: S3908 over GPIO I2C, starting in %u s\n", delay_s);
++	IOSleep(delay_s * 1000u);
++	st.pins = ml_io_map(TOUCH_PINS_PA, TOUCH_PINS_LEN);
++	if (!st.pins) {
++		printf("NEGRONI TOUCH: TLMM mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
+-		goto out;
+-	}
+-	printf("NEGRONI TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+-	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = negroni_rpmh_vreg_enable("ldoc11", 3200);
+-	if (power_error) {
+-		printf("NEGRONI TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+-		goto out;
+-	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+-	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+-	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("NEGRONI TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	printf("NEGRONI TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+-	    fe1, fe2, fid1, fid2, st.irq_status);
+-	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+-	if (st.dead || goodix == fts) {
+-		printf("NEGRONI TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+-		    goodix, fts, st.dead);
+-		goto out;
+-	}
+-	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("NEGRONI TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+-	unsigned errors = 0, ticks = 0;
+-	while (!st.dead) {
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+-			if (err) {
++	st.line.pins = (volatile uint8_t *)st.pins;
++	tlmm_i2c_init(&st.bus, &st.line, touch_udelay);
++	st.tcm.io.ctx = &st.bus;
++	st.tcm.io.read = touch_i2c_read;
++	st.tcm.io.write = touch_i2c_write;
++	printf("NEGRONI TOUCH: reset=%d attn=%d sda=%d scl=%d (Mu leaves the panel powered)\n",
++	    (int)((*(volatile uint32_t *)(st.pins + TOUCH_PIN(NT_PIN_RESET) + 4) >> 1) & 1),
++	    touch_attn(), ti_get_sda(&st.line), ti_get_scl(&st.line));
++
++	if (touch_setup()) {
++		/* Reset the IC (reset low 10 ms, firmware boot 200 ms) and try once more. */
++		volatile uint32_t *rst = (volatile uint32_t *)(st.pins + TOUCH_PIN(NT_PIN_RESET) + 4);
++		*rst = 0;
++		IOSleep(10);
++		*rst = TLMM_OUT;
++		IOSleep(200);
++		if (touch_setup()) {
++			printf("NEGRONI TOUCH: no report config; stopping\n");
++			goto out;
++		}
++	}
++	printf("NEGRONI TOUCH: running, %ux%u -> %ux%u, poll 10 ms on ATTN\n",
++	    TCM_PANEL_MAX_X, TCM_PANEL_MAX_Y, TOUCH_W, TOUCH_H);
++
++	unsigned errors = 0;
++	for (;;) {
++		for (int n = 0; n < 4 && !touch_attn(); n++) {
++			int rc = tcm_read_message(&st.tcm);
++			if (rc < 0) {
+ 				if ((errors++ % 100u) == 0) {
+-					printf("NEGRONI TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++					printf("NEGRONI TOUCH: read rc=%d bus=%d\n", rc, st.tcm.transport_error);
+ 				}
+ 				if (errors == 10) {
+-					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++					touch_release_all();
+ 				}
+-			} else {
+-				errors = 0;
++				break;
++			}
++			errors = 0;
++			if (rc == 0 && st.tcm.code == TCM_REPORT_TOUCH && tcm_parse_touch(&st.tcm) == 0) {
++				touch_report();
+ 			}
+ 		}
+-		touch_wait(10);
++		IOSleep(10);
+ 	}
+-	touch_report(0, st.x, st.y);
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+@@ -645,7 +213,7 @@ negroni_touch_init(void)
+ 	}
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("negronitouch", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("negronitouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("negronitouchlog", &st.log, sizeof(st.log));
+ 	if (!enabled) {
+ 		printf("NEGRONI TOUCH: disabled (negronitouch=0)\n");
+ 		return;
+diff --git a/bsd/dev/negroni_touch/gpio_i2c.h b/bsd/dev/negroni_touch/gpio_i2c.h
+new file mode 100755
+index 0000000..5fc2528
+--- /dev/null
++++ b/bsd/dev/negroni_touch/gpio_i2c.h
+@@ -0,0 +1,100 @@
++/* Polled open-drain I2C fallback; 5 us half-period, bounded clock stretching.
++ * Line callbacks release the pin for 1 and drive only LOW for 0.
++ * Caller owns the bus and serializes transfers. No GENI/GPI accesses.
++ */
++#ifndef NEGRONI_GPIO_I2C_H
++#define NEGRONI_GPIO_I2C_H
++#include <stdint.h>
++struct gpio_i2c {
++    void *ctx;
++    void (*sda)(void *, int);
++    void (*scl)(void *, int);
++    int (*get_sda)(void *);
++    int (*get_scl)(void *);
++    void (*delay)(unsigned);
++};
++/* Same transport codes as geni_i2c: -2 NACK, -3 bus busy, -4 timeout. */
++static inline int gi_high(struct gpio_i2c *g)
++{
++    g->scl(g->ctx, 1);
++    for (unsigned n = 0; n < 1000; n++) {
++        if (g->get_scl(g->ctx)) { g->delay(5); return 0; }
++        g->delay(1);
++    }
++    return -4;
++}
++static inline void gi_low(struct gpio_i2c *g)
++{
++    g->scl(g->ctx, 0);
++    g->delay(5);
++}
++static inline int gi_stop(struct gpio_i2c *g)
++{
++    gi_low(g);
++    g->sda(g->ctx, 0);
++    g->delay(5);
++    int rc = gi_high(g);
++    g->sda(g->ctx, 1);
++    g->delay(5);
++    return rc;
++}
++static inline int gi_byte(struct gpio_i2c *g, uint8_t v)
++{
++    for (unsigned i = 0; i < 8; i++) {
++        g->sda(g->ctx, (v & 0x80) != 0);
++        g->delay(5);
++        int rc = gi_high(g);
++        if (rc) return rc;
++        gi_low(g);
++        v <<= 1;
++    }
++    g->sda(g->ctx, 1);
++    g->delay(5);
++    int rc = gi_high(g);
++    if (rc) return rc;
++    int nack = g->get_sda(g->ctx);
++    gi_low(g);
++    return nack ? -2 : 0;
++}
++static inline int gi_start(struct gpio_i2c *g, uint8_t addr, int read)
++{
++    g->sda(g->ctx, 1);
++    int rc = gi_high(g);
++    if (rc) return rc;
++    if (!g->get_sda(g->ctx)) return -3;
++    g->sda(g->ctx, 0);
++    g->delay(5);
++    gi_low(g);
++    return gi_byte(g, (uint8_t)((addr << 1) | read));
++}
++static inline int gpio_i2c_write(struct gpio_i2c *g, uint8_t addr, const uint8_t *buf, uint32_t len)
++{
++    int rc = gi_start(g, addr, 0);
++    for (uint32_t i = 0; !rc && i < len; i++) rc = gi_byte(g, buf[i]);
++    int stop = gi_stop(g);
++    return rc ? rc : stop;
++}
++static inline int gpio_i2c_read(struct gpio_i2c *g, uint8_t addr, uint8_t *buf, uint32_t len)
++{
++    int rc = gi_start(g, addr, 1);
++    for (uint32_t i = 0; !rc && i < len; i++) {
++        uint8_t v = 0;
++        g->sda(g->ctx, 1);
++        for (unsigned bit = 0; bit < 8; bit++) {
++            rc = gi_high(g);
++            if (rc) break;
++            v = (uint8_t)((v << 1) | !!g->get_sda(g->ctx));
++            gi_low(g);
++        }
++        if (rc) break;
++        buf[i] = v;
++        g->sda(g->ctx, i + 1 == len); /* ACK each byte except the last. */
++        g->delay(5);
++        rc = gi_high(g);
++        gi_low(g);
++        g->sda(g->ctx, 1);
++    }
++    int stop = gi_stop(g);
++    return rc ? rc : stop;
++}
++#endif
+diff --git a/bsd/dev/negroni_touch/syna_tcm.h b/bsd/dev/negroni_touch/syna_tcm.h
+new file mode 100755
+index 0000000..27ca6a3
+--- /dev/null
++++ b/bsd/dev/negroni_touch/syna_tcm.h
+@@ -0,0 +1,262 @@
++/*
++ * Synaptics TouchComm (TCM v1) host side for the negroni S3908, OS independent.
++ *
++ * From the OPLUS driver in the XEC negroni tree (476a4a8,
++ * drivers/input/touchscreen/synaptics_tcm_oncell.{c,h}):
++ *   read:  4-byte header {0xA5, code, len_lo, len_hi}; when len > 0 a second
++ *          read of len + 3 bytes {0xA5, 0x03 (continued read), payload, 0x5A}
++ *   write: {command, len_lo, len_hi, payload...}
++ *   touch report 0x11 is a bit stream described by the touch report config
++ *   (command 0x25), parsed like syna_parse_report().
++ *
++ * The transport is the caller's: tcm_io.read/write move whole I2C messages.
++ */
++#ifndef NEGRONI_SYNA_TCM_H
++#define NEGRONI_SYNA_TCM_H
++
++#include <stdint.h>
++
++#define TCM_MARKER			0xA5
++#define TCM_PADDING			0x5A
++#define TCM_STATUS_IDLE			0x00
++#define TCM_STATUS_OK			0x01
++#define TCM_STATUS_BUSY			0x02
++#define TCM_STATUS_CONTINUED_READ	0x03
++#define TCM_REPORT_IDENTIFY		0x10
++#define TCM_REPORT_TOUCH		0x11
++#define TCM_CMD_GET_TOUCH_REPORT_CONFIG	0x25
++
++#define TCM_MAX_OBJECTS			10
++#define TCM_MAX_PAYLOAD			512
++#define TCM_MAX_CONFIG			256
++
++/* touch report config codes (enum touch_report_code) */
++enum {
++	TCM_TOUCH_END = 0,
++	TCM_TOUCH_FOREACH_ACTIVE_OBJECT,
++	TCM_TOUCH_FOREACH_OBJECT,
++	TCM_TOUCH_FOREACH_END,
++	TCM_TOUCH_PAD_TO_NEXT_BYTE,
++	TCM_TOUCH_TIMESTAMP,
++	TCM_TOUCH_OBJECT_N_INDEX,
++	TCM_TOUCH_OBJECT_N_CLASSIFICATION,
++	TCM_TOUCH_OBJECT_N_X_POSITION,
++	TCM_TOUCH_OBJECT_N_Y_POSITION,
++	TCM_TOUCH_OBJECT_N_Z,
++	TCM_TOUCH_NUM_OF_ACTIVE_OBJECTS = 24,
++};
++
++/* negroni DT: touchpanel,panel-coords = <5760 12864>, display-coords = <1440 3216> */
++#define TCM_PANEL_MAX_X			5760
++#define TCM_PANEL_MAX_Y			12864
++
++struct tcm_io {
++	void *ctx;
++	int (*read)(void *ctx, uint8_t *buf, uint32_t len);		/* 0 = ok */
++	int (*write)(void *ctx, const uint8_t *buf, uint32_t len);
++};
++
++struct tcm_object {
++	uint8_t status;		/* classification: 0 none, 1 finger, others glove/palm/hover */
++	uint32_t x, y, z;
++};
++
++struct tcm {
++	struct tcm_io io;
++	uint8_t config[TCM_MAX_CONFIG];
++	uint32_t config_len;
++	uint8_t payload[TCM_MAX_PAYLOAD];
++	uint32_t payload_len;
++	uint8_t code;
++	uint8_t header[4];	/* last wire header, for diagnostics */
++	int transport_error;	/* preserve the bus driver's failure code */
++	struct tcm_object obj[TCM_MAX_OBJECTS];
++};
++
++/*
++ * Read one message. 0: message in t->code / t->payload; 1: nothing pending
++ * (no marker, the controller has no data); <0: transport or framing error.
++ */
++static inline int tcm_read_message(struct tcm *t)
++{
++	uint8_t *hdr = t->header;
++	uint8_t buf[TCM_MAX_PAYLOAD + 3];
++	uint32_t len;
++
++	t->code = 0;
++	t->payload_len = 0;
++	for (uint32_t i = 0; i < 4; i++)
++		hdr[i] = 0;
++	t->transport_error = t->io.read(t->io.ctx, hdr, 4);
++	if (t->transport_error)
++		return -1;
++	if (hdr[0] != TCM_MARKER)
++		return 1;
++	t->code = hdr[1];
++	/* Idle/busy have no payload, even if their length bytes contain filler. */
++	if (t->code == TCM_STATUS_IDLE || t->code == TCM_STATUS_BUSY)
++		return 1;
++	if (t->code == TCM_STATUS_CONTINUED_READ)
++		return -3;	/* a previous reader consumed the message header */
++	len = hdr[2] | ((uint32_t)hdr[3] << 8);
++	t->payload_len = 0;
++	if (!len)
++		return 0;
++	if (len > TCM_MAX_PAYLOAD)
++		return -2;
++	t->transport_error = t->io.read(t->io.ctx, buf, len + 3);
++	if (t->transport_error)
++		return -1;
++	if (buf[0] != TCM_MARKER || buf[1] != TCM_STATUS_CONTINUED_READ || buf[len + 2] != TCM_PADDING)
++		return -3;
++	for (uint32_t i = 0; i < len; i++)
++		t->payload[i] = buf[2 + i];
++	t->payload_len = len;
++	return 0;
++}
++
++static inline int tcm_write_command(struct tcm *t, uint8_t cmd, const uint8_t *payload, uint32_t len)
++{
++	uint8_t buf[3 + 32];
++
++	if (len > 32)
++		return -2;
++	buf[0] = cmd;
++	buf[1] = (uint8_t)len;
++	buf[2] = (uint8_t)(len >> 8);
++	for (uint32_t i = 0; i < len; i++)
++		buf[3 + i] = payload[i];
++	t->transport_error = t->io.write(t->io.ctx, buf, 3 + len);
++	return t->transport_error ? -1 : 0;
++}
++
++/*
++ * Send a command and wait for its response; reports that arrive in between are
++ * dropped. wait() is the caller's delay (about 1 ms) between polls.
++ */
++static inline int tcm_command(struct tcm *t, uint8_t cmd, const uint8_t *payload, uint32_t len,
++			      void (*wait)(void), uint32_t tries)
++{
++	if (tcm_write_command(t, cmd, payload, len))
++		return -1;
++	while (tries--) {
++		int rc = tcm_read_message(t);
++
++		if (rc < 0)
++			return rc;
++		if (rc == 0 && t->code < TCM_REPORT_IDENTIFY)
++			return t->code == TCM_STATUS_OK ? 0 : -4;
++		wait();
++	}
++	return -5;
++}
++
++/* Fetch the touch report config (needed by tcm_parse_touch). */
++static inline int tcm_get_report_config(struct tcm *t, void (*wait)(void))
++{
++	int rc = tcm_command(t, TCM_CMD_GET_TOUCH_REPORT_CONFIG, 0, 0, wait, 200);
++
++	if (rc)
++		return rc;
++	if (t->payload_len > TCM_MAX_CONFIG)
++		return -2;
++	for (uint32_t i = 0; i < t->payload_len; i++)
++		t->config[i] = t->payload[i];
++	t->config_len = t->payload_len;
++	return 0;
++}
++
++/* syna_get_report_data(): bits (<= 32) at bit offset, LSB first. */
++static inline uint32_t tcm_bits(const struct tcm *t, uint32_t offset, uint32_t bits)
++{
++	uint32_t out = 0, done = 0;
++
++	if (!bits || bits > 32 || offset + bits > t->payload_len * 8)
++		return 0;
++	while (done < bits) {
++		uint32_t byte = offset / 8, shift = offset % 8;
++		uint32_t take = 8 - shift < bits - done ? 8 - shift : bits - done;
++		uint32_t v = ((uint32_t)t->payload[byte] >> shift) & (0xffu >> (8 - take));
++
++		out |= v << done;
++		done += take;
++		offset += take;
++	}
++	return out;
++}
++
++/* Parse a touch report (t->code == TCM_REPORT_TOUCH) into t->obj[]. 0 or <0. */
++static inline int tcm_parse_touch(struct tcm *t)
++{
++	uint32_t idx = 0, offset = 0, obj = 0, next = 0, objects = 0, active = 0;
++	int active_only = 0, have_active = 0;
++
++	for (int i = 0; i < TCM_MAX_OBJECTS; i++)
++		t->obj[i].status = 0;
++	while (idx < t->config_len) {
++		uint8_t code = t->config[idx++];
++		uint32_t bits, v;
++
++		switch (code) {
++		case TCM_TOUCH_END:
++			return 0;
++		case TCM_TOUCH_FOREACH_ACTIVE_OBJECT:
++		case TCM_TOUCH_FOREACH_OBJECT:
++			obj = 0;
++			next = idx;
++			active_only = code == TCM_TOUCH_FOREACH_ACTIVE_OBJECT;
++			break;
++		case TCM_TOUCH_FOREACH_END:
++			if (active_only) {
++				if (have_active) {
++					if (++objects < active)
++						idx = next;
++				} else if (offset < t->payload_len * 8) {
++					idx = next;
++				}
++			} else if (++obj < TCM_MAX_OBJECTS) {
++				idx = next;
++			}
++			break;
++		case TCM_TOUCH_PAD_TO_NEXT_BYTE:
++			offset = (offset + 7) & ~7u;
++			break;
++		default:
++			if (idx >= t->config_len)
++				return -1;
++			bits = t->config[idx++];
++			v = tcm_bits(t, offset, bits);
++			offset += bits;
++			switch (code) {
++			case TCM_TOUCH_OBJECT_N_INDEX:
++				if (v >= TCM_MAX_OBJECTS)
++					return -1;
++				obj = v;
++				break;
++			case TCM_TOUCH_OBJECT_N_CLASSIFICATION:
++				t->obj[obj].status = (uint8_t)v;
++				break;
++			case TCM_TOUCH_OBJECT_N_X_POSITION:
++				t->obj[obj].x = v;
++				break;
++			case TCM_TOUCH_OBJECT_N_Y_POSITION:
++				t->obj[obj].y = v;
++				break;
++			case TCM_TOUCH_OBJECT_N_Z:
++				t->obj[obj].z = v;
++				break;
++			case TCM_TOUCH_NUM_OF_ACTIVE_OBJECTS:
++				active = v;
++				have_active = 1;
++				if (!active)
++					return 0;
++				break;
++			default:	/* timestamp, widths, gestures, grip: skipped */
++				break;
++			}
++		}
++	}
++	return 0;
++}
++
++#endif
+diff --git a/bsd/dev/negroni_touch/tlmm.h b/bsd/dev/negroni_touch/tlmm.h
+new file mode 100755
+index 0000000..84ee57a
+--- /dev/null
++++ b/bsd/dev/negroni_touch/tlmm.h
+@@ -0,0 +1,93 @@
++/*
++ * SM8450 TLMM pin control, MMIO only (Linux drivers/pinctrl/qcom/pinctrl-msm.c
++ * layout, pinctrl-sm8450.c: REG_SIZE 0x1000, ctl at n * 0x1000, io at +4).
++ * TLMM base 0x0F100000 (sm8450.dtsi tlmm: pinctrl@f100000).
++ */
++#ifndef NEGRONI_TLMM_H
++#define NEGRONI_TLMM_H
++
++#include <stdint.h>
++
++#define TLMM_BASE		0x0F100000u
++#define TLMM_CTL(n)		((uint32_t)(n) * 0x1000u)
++#define TLMM_IO(n)		((uint32_t)(n) * 0x1000u + 4u)
++
++#define TLMM_PULL_NONE		0u
++#define TLMM_PULL_DOWN		1u
++#define TLMM_PULL_UP		3u
++#define TLMM_FUNC(f)		((uint32_t)(f) << 2)		/* 0 = gpio */
++#define TLMM_DRIVE_MA(ma)	((uint32_t)((ma) / 2 - 1) << 6)
++#define TLMM_OE			(1u << 9)
++#define TLMM_IN			(1u << 0)
++#define TLMM_OUT		(1u << 1)
++
++/* negroni touch pins (sm8450.dtsi qup_i2c4_data_clk, negroni.dts ts_*_active, synaptics20031@4b) */
++#define NT_PIN_I2C_SDA		16	/* function qup4 = 1 */
++#define NT_PIN_I2C_SCL		17
++#define NT_PIN_RESET		20	/* active low */
++#define NT_PIN_IRQ		21	/* ATTN, active low */
++#define NT_PIN_1V8_EN		186	/* enable1v8_gpio: driven high to enable (oplus touchpanel uses the raw gpio number, the DT flag is not applied) */
++#define NT_FUNC_QUP4		1
++
++static inline void tlmm_cfg(volatile uint8_t *tlmm, unsigned pin, uint32_t cfg)
++{
++	*(volatile uint32_t *)(tlmm + TLMM_CTL(pin)) = cfg;
++}
++
++static inline void tlmm_out(volatile uint8_t *tlmm, unsigned pin, int high)
++{
++	*(volatile uint32_t *)(tlmm + TLMM_IO(pin)) = high ? TLMM_OUT : 0;
++}
++
++static inline int tlmm_in(volatile uint8_t *tlmm, unsigned pin)
++{
++	return (int)(*(volatile uint32_t *)(tlmm + TLMM_IO(pin)) & TLMM_IN);
++}
++
++/* I2C pins to qup4 with pull-ups, ATTN input, reset and 1.8 V enable as outputs (reset held). */
++/* SDA/SCL on qup4 with pull-ups */
++static inline void nt_pins_setup_i2c(volatile uint8_t *tlmm)
++{
++	tlmm_cfg(tlmm, NT_PIN_I2C_SDA, TLMM_FUNC(NT_FUNC_QUP4) | TLMM_DRIVE_MA(2) | TLMM_PULL_UP);
++	tlmm_cfg(tlmm, NT_PIN_I2C_SCL, TLMM_FUNC(NT_FUNC_QUP4) | TLMM_DRIVE_MA(2) | TLMM_PULL_UP);
++}
++
++static inline void nt_pins_setup(volatile uint8_t *tlmm)
++{
++	nt_pins_setup_i2c(tlmm);
++	tlmm_cfg(tlmm, NT_PIN_IRQ, TLMM_FUNC(0) | TLMM_DRIVE_MA(8) | TLMM_PULL_NONE);
++	tlmm_out(tlmm, NT_PIN_RESET, 0);
++	tlmm_cfg(tlmm, NT_PIN_RESET, TLMM_FUNC(0) | TLMM_DRIVE_MA(8) | TLMM_PULL_NONE | TLMM_OE);
++	tlmm_out(tlmm, NT_PIN_1V8_EN, 1);	/* 1.8 V load switch on */
++	tlmm_cfg(tlmm, NT_PIN_1V8_EN, TLMM_FUNC(0) | TLMM_DRIVE_MA(2) | TLMM_PULL_NONE | TLMM_OE);
++}
++
++/*
++ * I2C bus recovery (i2c_generic_scl_recovery): SDA held low by a target that was cut off mid-byte.
++ * Pins as GPIO, open drain emulated with OE: up to 9 SCL pulses until SDA is released, then STOP.
++ * Returns the SDA level afterwards (1 = bus free). The caller puts the pins back on qup4.
++ */
++static inline int nt_i2c_recover(volatile uint8_t *tlmm, void (*udelay)(unsigned))
++{
++	uint32_t in = TLMM_FUNC(0) | TLMM_DRIVE_MA(2) | TLMM_PULL_UP;
++
++	tlmm_cfg(tlmm, NT_PIN_I2C_SDA, in);
++	tlmm_cfg(tlmm, NT_PIN_I2C_SCL, in);
++	udelay(10);
++	for (int i = 0; i < 9 && !tlmm_in(tlmm, NT_PIN_I2C_SDA); i++) {
++		tlmm_out(tlmm, NT_PIN_I2C_SCL, 0);
++		tlmm_cfg(tlmm, NT_PIN_I2C_SCL, in | TLMM_OE);		/* drive SCL low */
++		udelay(5);
++		tlmm_cfg(tlmm, NT_PIN_I2C_SCL, in);			/* release: pulled high */
++		udelay(5);
++	}
++	/* STOP: SDA low -> high while SCL is high */
++	tlmm_out(tlmm, NT_PIN_I2C_SDA, 0);
++	tlmm_cfg(tlmm, NT_PIN_I2C_SDA, in | TLMM_OE);
++	udelay(5);
++	tlmm_cfg(tlmm, NT_PIN_I2C_SDA, in);
++	udelay(5);
++	return tlmm_in(tlmm, NT_PIN_I2C_SDA);
++}
++
++#endif
+diff --git a/bsd/dev/negroni_touch/tlmm_i2c.h b/bsd/dev/negroni_touch/tlmm_i2c.h
+new file mode 100755
+index 0000000..6252742
+--- /dev/null
++++ b/bsd/dev/negroni_touch/tlmm_i2c.h
+@@ -0,0 +1,26 @@
++/* Map only GPIO16/17 pages (0xf110000, length 0x2000). */
++#ifndef NEGRONI_TLMM_I2C_H
++#define NEGRONI_TLMM_I2C_H
++#include "gpio_i2c.h"
++#include "tlmm.h"
++struct tlmm_i2c { volatile uint8_t *pins; };
++static inline void ti_line(void *ctx, unsigned off, int release)
++{
++    struct tlmm_i2c *p = ctx;
++    /* Never drive a high level: latch zero, switch output enable only. */
++    *(volatile uint32_t *)(p->pins + off + 4) = 0;
++    *(volatile uint32_t *)(p->pins + off) = TLMM_FUNC(0) | TLMM_DRIVE_MA(2) |
++        TLMM_PULL_UP | (release ? 0 : TLMM_OE);
++    (void)*(volatile uint32_t *)(p->pins + off); /* complete configuration write */
++}
++static inline void ti_sda(void *p, int r) { ti_line(p, 0, r); }
++static inline void ti_scl(void *p, int r) { ti_line(p, 0x1000, r); }
++static inline int ti_get_sda(void *p) { return *(volatile uint32_t *)(((struct tlmm_i2c *)p)->pins + 4) & 1; }
++static inline int ti_get_scl(void *p) { return *(volatile uint32_t *)(((struct tlmm_i2c *)p)->pins + 0x1004) & 1; }
++static inline void tlmm_i2c_init(struct gpio_i2c *g, struct tlmm_i2c *pins, void (*delay)(unsigned))
++{
++    g->ctx = pins; g->sda = ti_sda; g->scl = ti_scl;
++    g->get_sda = ti_get_sda; g->get_scl = ti_get_scl; g->delay = delay;
++    ti_sda(pins, 1); ti_scl(pins, 1); delay(5);
++}
++#endif
+diff --git a/iokit/Kernel/arm/hid/NegroniHID.cpp b/iokit/Kernel/arm/hid/NegroniHID.cpp
+index cf63cc3..3c8c976 100644
+--- a/iokit/Kernel/arm/hid/NegroniHID.cpp
++++ b/iokit/Kernel/arm/hid/NegroniHID.cpp
+@@ -459,7 +459,7 @@ NegroniHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > 2411 ? 2411 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];

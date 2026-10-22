@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index a528e21..170271d 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -21,6 +21,8 @@
+  *              whether its firmware can be loaded through the register window
+  *  11  asks    TrustZone (SMC, through the hypervisor) calls that pass no memory: is-call-available,
+  *              the PAS image calls, and which images it "supports" (GPU zap = image 13)
++ *  12  asks    TrustZone to check the signature of a730_zap.mdt (from the firmware area,
++ *              negroni_fw_get) via PAS init image: the first of Linux's three zap calls
+  * negroniadreno_pause=MS waits after each announcement (default 500), so the
+  * persistent log has the line before a silent reset.
+  *
+@@ -34,8 +36,12 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern const void *negroni_fw_get(const char *name, uint32_t *size);
++extern uint64_t kvtophys(vm_offset_t va);     /* osfmk/arm/pmap/pmap.h (pmap_paddr_t) */
+ void negroni_adreno_init(void);
+ 
+ #define GCC_PHYS        0x00100000UL
+@@ -95,6 +101,7 @@ void negroni_adreno_init(void);
+ #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
+ #define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
+ #define SCM_ONE_VALUE           1
++#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)    /* a number, then a read-write buffer address */
+ #define SCM_INTERRUPTED         1
+ #define PAS_GPU                 13
+ 
+@@ -575,9 +582,54 @@ step_trustzone(void)
+ 	return true;
+ }
+ 
++/*
++ * Linux qcom_mdt_pas_init -> qcom_scm_pas_init_image: TrustZone gets the zap
++ * image's header (the whole .mdt: ELF header, program headers and the hash
++ * segment) in one physically contiguous buffer and checks the signature.
++ * TrustZone protects that memory while it works, so it is never freed.
++ */
++static bool
++step_zap_signature(void)
++{
++	const uint8_t *mdt;
++	uint32_t size = 0, segments, hashes;
++	vm_offset_t page = 0;
++	uint64_t answer = ~0ull;
++
++	mdt = negroni_fw_get("a730_zap.mdt", &size);
++	if (mdt == NULL) {
++		printf("NEGRONI ADRENO: 12 stop: no a730_zap.mdt in the firmware area (mkfwarea.py + dd)\n");
++		return false;
++	}
++	segments = size >= 52 + 2 * 32 ? (uint32_t)(mdt[44] | mdt[45] << 8) : 0;
++	if (memcmp(mdt, "\177ELF\1", 5) != 0 || segments < 2 || size > PAGE_SIZE) {
++		printf("NEGRONI ADRENO: 12 stop: a730_zap.mdt is not a 32-bit ELF header (%u segments, %u bytes)\n",
++		    segments, size);
++		return false;
++	}
++	memcpy(&hashes, mdt + 52 + 32 + 16, sizeof(hashes));
++	printf("NEGRONI ADRENO: 12 zap header: %u segments, hash segment %u bytes, file %u bytes\n", segments, hashes, size);
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("NEGRONI ADRENO: 12 stop: no memory\n");
++		return false;
++	}
++	memcpy((void *)page, mdt, size);
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);      /* TrustZone reads memory, not our cache */
++	announce("hand the zap header to TrustZone for its signature check (PAS image 13)");
++	int32_t r = scm("PAS init image (zap)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++	    kvtophys(page), 0, &answer);
++	if (r == 0 && answer == 0) {
++		printf("NEGRONI ADRENO: 12 TRUSTZONE ACCEPTS THE ZAP SHADER SIGNATURE\n");
++		return true;
++	}
++	printf("NEGRONI ADRENO: 12 stop: TrustZone returns %d, answer %#llx\n", r, answer);
++	return false;
++}
++
+ static bool (*const steps[])(void) = {
+ 	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
+ 	step_rscc, step_smmu, step_smmu_context, step_gmu_memory, step_trustzone,
++	step_zap_signature,
+ };
+ 
+ void

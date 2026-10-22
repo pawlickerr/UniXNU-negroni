@@ -1,0 +1,22 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..9db1d27 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1867,6 +1867,17 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
++	/* Bring-up trace: timer IRQs at powers of two, the first other IRQs. */
++	static uint32_t negroni_vtimer_irqs, negroni_other_irqs;
++	if (intid == negroni_vtimer_intid) {
++		uint32_t n = ++negroni_vtimer_irqs;
++		if ((n & (n - 1)) == 0) {
++			kprintf("NEGRONI VTIMER irq %u tval %lld\n", n, (long long)(int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0"));
++		}
++	} else if (intid >= 16 && negroni_other_irqs < 16) {
++		negroni_other_irqs++;
++		kprintf("NEGRONI IRQ intid=%u handler=%p\n", intid, cdp->interrupt_handler);
++	}
+ 	if (intid == negroni_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */

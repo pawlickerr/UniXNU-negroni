@@ -1,0 +1,92 @@
+From: negroni-ios
+Subject: [PATCH] negroni: UFS power/clock check before touching the host (SM8450 GCC); no NegroniBattery
+
+---
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 8983bdf..4167a3b 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -353,6 +353,55 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/*
++ * negroni (SM8450): Mu's Qualcomm UFS driver can leave the UFS power domain or its clocks off at
++ * ExitBootServices, and a host register read with the AXI/AHB clocks gated stalls the bus (the CPU
++ * hangs, nothing is printed). Check and, if needed, switch on the GDSC and the branches first.
++ * GCC offsets from Linux drivers/clk/qcom/gcc-sm8450.c (GDSC bit31 PWR_ON, bit0 SW_COLLAPSE; CBCR
++ * bit31 CLK_OFF, bit0 CLK_ENABLE).
++ */
++#define GCC_UFS_PA         0x00187000u
++#define GCC_UFS_GDSCR      0x004u
++static const struct { const char *name; uint32_t off; } ufs_gcc_branches[] = {
++	{ "axi", 0x018 }, { "ahb", 0x020 }, { "tx_sym0", 0x024 }, { "rx_sym0", 0x028 },
++	{ "unipro", 0x064 }, { "ice", 0x06c }, { "phy_aux", 0x0a4 }, { "rx_sym1", 0x0c0 }, { "aggre_axi", 0x0d4 },
++};
++
++static int
++ufs_power_check(void)
++{
++	vm_offset_t gcc = ml_io_map(GCC_UFS_PA, 0x1000);
++	if (!gcc) {
++		printf("NEGRONI UFS: GCC map failed\n");
++		return ENOMEM;
++	}
++	volatile uint32_t *gdsc = (volatile uint32_t *)(gcc + GCC_UFS_GDSCR);
++	uint32_t g = *gdsc;
++	printf("NEGRONI UFS: GDSC 0x%08x (%s)\n", g, (g & 0x80000000u) ? "on" : "OFF");
++	if (!(g & 0x80000000u)) {
++		*gdsc = g & ~1u;	/* SW_COLLAPSE = 0 */
++		for (int i = 0; i < 1000 && !(*gdsc & 0x80000000u); i++) {
++			delay(10);
++		}
++		printf("NEGRONI UFS: GDSC now 0x%08x\n", *gdsc);
++		if (!(*gdsc & 0x80000000u)) {
++			return ENXIO;
++		}
++	}
++	for (size_t i = 0; i < sizeof(ufs_gcc_branches) / sizeof(ufs_gcc_branches[0]); i++) {
++		volatile uint32_t *cbcr = (volatile uint32_t *)(gcc + ufs_gcc_branches[i].off);
++		uint32_t c = *cbcr;
++		if (c & 0x80000000u) {
++			*cbcr = c | 1u;
++			for (int n = 0; n < 1000 && (*cbcr & 0x80000000u); n++) {
++				delay(10);
++			}
++		}
++		printf("NEGRONI UFS: clk %s 0x%08x -> 0x%08x\n", ufs_gcc_branches[i].name, c, *cbcr);
++	}
++	return 0;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -607,6 +656,11 @@ negroni_ufs_init(void)
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 
++	error = ufs_power_check();
++	if (error) {
++		printf("NEGRONI UFS: UFS power/clocks unavailable (%d), not touching the host\n", error);
++		return error;
++	}
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 81c4a5c..418ec11 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -77,11 +77,6 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = NegroniHIDTouch;"
+     "   },"
+-    "   {"
+-    "     'IOClass'         = NegroniBattery;"
+-    "     'IOProviderClass' = IOResources;"
+-    "     'IOMatchCategory' = NegroniBattery;"
+-    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

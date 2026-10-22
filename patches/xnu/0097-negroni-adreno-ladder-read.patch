@@ -1,0 +1,192 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 57fbc06..4f94a31 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/negroni_sample.c			standard
+ bsd/dev/negroni_keys.c			standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
++bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+new file mode 100644
+index 0000000..7b6dd9b
+--- /dev/null
++++ b/bsd/dev/negroni_adreno.c
+@@ -0,0 +1,154 @@
++/*
++ * NEGRONI (SM8450) Adreno 730, woken step by step (Linux msm a6xx/a7xx as the
++ * reference): an access the hypervisor does not allow can end
++ * the run without a word, so each step says what it is about to touch
++ * before touching it, reads come before writes, and a step that does not
++ * find what it needs ends the ladder.
++ *
++ * Boot arg negroniadreno=N performs steps 1..N (default 0: nothing).
++ *   1  reads   GCC branches that feed the GPU (CFG AHB, MEMNOC GFX, SNOC DVM, DDRSS GPU AXI)
++ *   2  reads   GPUCC: CX/GX GDSC state and the CX-side clocks, only when CFG AHB runs
++ *   3  reads   GMU CX registers (needs CX GDSC on and the GMU clock): AO counter, GMU state
++ *
++ * Addresses: sm8450.dtsi (gpu@3d00000, gmu@3d6a000, gpucc@3d90000,
++ * gcc@100000); offsets: Linux gcc-sm8450.c, gpucc-sm8450.c, a6xx_gmu.xml.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void negroni_adreno_init(void);
++
++#define GCC_PHYS        0x00100000UL
++#define GCC_SIZE        0x1f4200UL
++#define GPUCC_PHYS      0x03d90000UL
++#define GPUCC_SIZE      0xa000UL
++#define GMU_PHYS        0x03d6a000UL
++#define GMU_SIZE        0x35000UL
++#define GPU_PHYS        0x03d00000UL
++#define GMU_REG(dw)     ((vm_offset_t)(dw) * 4 - (GMU_PHYS - GPU_PHYS))
++
++#define BRANCH_CLK_OFF  (1u << 31)      /* CBCR: the clock is not running */
++#define GDSC_PWR_ON     (1u << 31)      /* GDSCR: the domain is powered */
++
++static uint32_t pause_ms = 500;
++
++/* A plain 32-bit load; the hypervisor's trap emulation copes with no other form. */
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void
++announce(const char *what)
++{
++	printf("NEGRONI ADRENO: about to read %s\n", what);
++	delay(pause_ms * 1000);
++}
++
++static const struct {
++	const char *name;
++	uint32_t offset;
++} gcc_branches[] = {
++	{ "GCC_GPU_CFG_AHB_CLK", 0x81004 },
++	{ "GCC_GPU_MEMNOC_GFX_CLK", 0x81010 },
++	{ "GCC_GPU_SNOC_DVM_GFX_CLK", 0x81018 },
++	{ "GCC_DDRSS_GPU_AXI_CLK", 0x81154 },
++};
++
++static const struct {
++	const char *name;
++	uint32_t offset;
++} gpucc_regs[] = {
++	{ "GPU_CX_GDSC", 0x9108 },
++	{ "GPU_GX_GDSC", 0x905c },
++	{ "GPU_CC_AHB_CLK", 0x911c },
++	{ "GPU_CC_CX_GMU_CLK", 0x913c },
++	{ "GPU_CC_CXO_CLK", 0x9144 },
++	{ "GPU_CC_HUB_CX_INT_CLK", 0x9148 },
++	{ "GPU_CC_MEMNOC_GFX_CLK", 0x9150 },
++	{ "GPU_CC_CX_SNOC_DVM_CLK", 0x9130 },
++	{ "GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK", 0x7000 },
++	{ "GPU_CC_GMU_CLK_SRC (CMD)", 0x9318 },
++};
++
++void
++negroni_adreno_init(void)
++{
++	uint32_t last = 0, v;
++	vm_offset_t gcc, gpucc, gmu;
++	bool cx_on = false, gmu_clk = false;
++
++	(void)PE_parse_boot_argn("negroniadreno", &last, sizeof(last));
++	(void)PE_parse_boot_argn("negroniadreno_pause", &pause_ms, sizeof(pause_ms));
++	if (last == 0) {
++		return;
++	}
++	printf("NEGRONI ADRENO: steps 1..%u\n", last);
++
++	/* 1: GCC */
++	announce("GCC GPU branches");
++	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	bool ahb_on = false;
++	for (unsigned i = 0; i < sizeof(gcc_branches) / sizeof(gcc_branches[0]); i++) {
++		v = rd(gcc + gcc_branches[i].offset);
++		printf("NEGRONI ADRENO: 1 %s = %#x (%s)\n", gcc_branches[i].name, v,
++		    (v & BRANCH_CLK_OFF) ? "off" : "running");
++		if (i == 0) {
++			ahb_on = !(v & BRANCH_CLK_OFF);
++		}
++	}
++	if (last < 2) {
++		goto done;
++	}
++	if (!ahb_on) {
++		printf("NEGRONI ADRENO: 2 stop: GCC_GPU_CFG_AHB_CLK is off, GPUCC unreachable\n");
++		goto done;
++	}
++
++	/* 2: GPUCC */
++	announce("GPUCC (GDSCs and CX clocks)");
++	gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
++	for (unsigned i = 0; i < sizeof(gpucc_regs) / sizeof(gpucc_regs[0]); i++) {
++		v = rd(gpucc + gpucc_regs[i].offset);
++		bool gdsc = i < 2;
++		printf("NEGRONI ADRENO: 2 %s = %#x (%s)\n", gpucc_regs[i].name, v,
++		    gdsc ? ((v & GDSC_PWR_ON) ? "powered" : "off") : ((v & BRANCH_CLK_OFF) ? "off" : "running"));
++		if (i == 0) {
++			cx_on = (v & GDSC_PWR_ON) != 0;
++		}
++		if (i == 3) {
++			gmu_clk = !(v & BRANCH_CLK_OFF);
++		}
++	}
++	if (last < 3) {
++		goto done;
++	}
++	if (!cx_on || !gmu_clk) {
++		printf("NEGRONI ADRENO: 3 stop: CX GDSC %s, GMU clock %s (step 4 would switch them on)\n",
++		    cx_on ? "on" : "off", gmu_clk ? "running" : "off");
++		goto done;
++	}
++
++	/* 3: GMU CX registers: a6xx_gmu.xml dword offsets count from the GPU base 0x3d00000 */
++	announce("GMU CX registers");
++	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
++	for (int i = 0; i < 3; i++) {
++		uint32_t lo = rd(gmu + GMU_REG(0x1f888));        /* GMU_CX_GMU_ALWAYS_ON_COUNTER_L */
++		printf("NEGRONI ADRENO: 3 GMU AO counter low = %#x\n", lo);
++		delay(1000);
++	}
++	printf("NEGRONI ADRENO: 3 GMU_CM3_FW_INIT_RESULT = %#x, GMU_CM3_SYSRESET = %#x\n",
++	    rd(gmu + GMU_REG(0x1f81c)), rd(gmu + GMU_REG(0x1f800)));
++
++done:
++	printf("NEGRONI ADRENO: done (step %u)\n", last);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 133b69f..01d1433 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -53,6 +53,7 @@ extern void negroni_sample_start(void);
+ extern void negroni_keys_init(void);
+ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
++extern void negroni_adreno_init(void);
+ extern void negroni_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -733,6 +734,7 @@ negroni_ufs_init(void)
+ 	negroni_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
+ 	negroni_cpufreq_init();
++	negroni_adreno_init();
+ 	negroni_keys_init();
+ 	negroni_touch_init();
+ 	negroni_usb_probe();

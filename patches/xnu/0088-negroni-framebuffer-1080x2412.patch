@@ -1,0 +1,93 @@
+From: negroni-ios
+Subject: [PATCH] negroni: framebuffer at 0xB8000000, 1080x2412 (Mu GOP), early console and touch mapping
+
+---
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index b580855..953e6c3 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Built-in IOMobileFramebuffer for NEGRONI: the ABL's continuous-splash
+- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
++ * framebuffer (1080x2412 a8r8g8b8 in RAM, the panel scans it out by
+  * itself) as the main display, driven by CoreAnimation's CPU renderer.
+  *
+  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+@@ -75,7 +75,7 @@ enum {
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * centered 1080x2412 part of it is shown on the 1080x2412 panel.
+  * Boot-arg negronifb_native=1 presents the real panel size instead.
+  */
+ #define NEGRONI_FB_LOGICAL_W              1125
+diff --git a/iokit/Kernel/arm/hid/NegroniHID.cpp b/iokit/Kernel/arm/hid/NegroniHID.cpp
+index 88c45c2..cf63cc3 100644
+--- a/iokit/Kernel/arm/hid/NegroniHID.cpp
++++ b/iokit/Kernel/arm/hid/NegroniHID.cpp
+@@ -435,9 +435,9 @@ NegroniHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("negronifb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
++	fLogicalH = native ? 2412 : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fOffY = (fLogicalH - 2412) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 58cff10..e397f67 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ negroni_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = 0xb8000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/negroni_early.c b/osfmk/arm64/negroni_early.c
+index 8a96e97..5cb1a28 100644
+--- a/osfmk/arm64/negroni_early.c
++++ b/osfmk/arm64/negroni_early.c
+@@ -11,10 +11,10 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xb8000000;   /* Mu GOP framebuffer ("Display Reserved") */
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
++#define EARLY_HEIGHT 2412u
+ #define EARLY_STRIDE (4320u / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f5cf649..02f03be 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,7 +515,7 @@ LEXT(start_first_cpu)
+ 
+ #if defined(NEGRONI)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (0xb8000000 + 2380 * 4320)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -686,7 +686,7 @@ Lkernelcache_base_found:
+ 	 * NEGRONI uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0xb8000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)

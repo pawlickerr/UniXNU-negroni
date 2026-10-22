@@ -1,0 +1,82 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 9db1d27..58bf270 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -43,6 +43,9 @@
+ #include <kern/restartable.h>
+ #include <kern/socd_client.h>
+ #include <kern/thread.h>
++#if defined(NEGRONI)
++#include <kern/task.h>
++#endif
+ #include <kern/zalloc_internal.h>
+ #include <mach/exception.h>
+ #include <mach/arm/traps.h>
+@@ -1847,6 +1850,57 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(NEGRONI)
++/*
++ * Bring-up: where do blocked kernel threads wait? Saved fp/lr of every
++ * kernel_task thread off the CPU, then its frame-pointer chain (low 32 bits
++ * of each return address, symbolize offline). The thread whose chain passes
++ * PE_lockdown_iokit (the boot thread) is marked MAIN and printed in full.
++ * Called from the timer IRQ on a hung boot; walks the list without locks.
++ */
++extern void PE_lockdown_iokit(void);
++void negroni_dump_kernel_threads(void);
++void
++negroni_dump_kernel_threads(void)
++{
++	thread_t th;
++	int nth = 0;
++	uint64_t lo = (uint64_t)&PE_lockdown_iokit;
++
++	kprintf("NEGRONI BT: kernel threads, current %llu\n", current_thread()->thread_id);
++	queue_iterate(&kernel_task->threads, th, thread_t, task_threads) {
++		if (++nth > 96) {
++			break;
++		}
++		if (th == current_thread() || th->kernel_stack == 0) {
++			continue;
++		}
++		thread_kernel_state_t ks = (thread_kernel_state_t)th->machine.kstackptr;
++		uint64_t base = th->kernel_stack, top = base + kernel_stack_size;
++		uint64_t pcs[24];
++		int depth = 0, is_main = 0;
++		pcs[depth++] = ks->machine.ss.lr;
++		for (uint64_t fp = ks->machine.ss.fp; depth < 24 && fp >= base && fp + 16 <= top && (fp & 7) == 0;) {
++			uint64_t lr = ((uint64_t *)fp)[1];
++			pcs[depth++] = lr;
++			if (lr - lo < 0x200) {
++				is_main = 1;
++			}
++			uint64_t next = ((uint64_t *)fp)[0];
++			if (next <= fp) {
++				break;
++			}
++			fp = next;
++		}
++		kprintf("NEGRONI BT %s%llu st %x:", is_main ? "MAIN " : "", th->thread_id, th->state);
++		for (int i = 0; i < (is_main ? depth : (depth < 6 ? depth : 6)); i++) {
++			kprintf(" %08x", (uint32_t)pcs[i]);
++		}
++		kprintf("\n");
++	}
++}
++#endif /* NEGRONI */
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1874,6 +1928,9 @@ sleh_irq(arm_saved_state_t *state)
+ 		if ((n & (n - 1)) == 0) {
+ 			kprintf("NEGRONI VTIMER irq %u tval %lld\n", n, (long long)(int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0"));
+ 		}
++		if (n == 16384) {
++			negroni_dump_kernel_threads();
++		}
+ 	} else if (intid >= 16 && negroni_other_irqs < 16) {
+ 		negroni_other_irqs++;
+ 		kprintf("NEGRONI IRQ intid=%u handler=%p\n", intid, cdp->interrupt_handler);

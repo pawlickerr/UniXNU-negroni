@@ -1,0 +1,70 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 58bf270..d0af170 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1864,7 +1864,8 @@ void
+ negroni_dump_kernel_threads(void)
+ {
+ 	thread_t th;
+-	int nth = 0;
++	int nth = 0, found_main = 0;
++	thread_t oldest = THREAD_NULL;
+ 	uint64_t lo = (uint64_t)&PE_lockdown_iokit;
+ 
+ 	kprintf("NEGRONI BT: kernel threads, current %llu\n", current_thread()->thread_id);
+@@ -1892,11 +1893,51 @@ negroni_dump_kernel_threads(void)
+ 			}
+ 			fp = next;
+ 		}
+-		kprintf("NEGRONI BT %s%llu st %x:", is_main ? "MAIN " : "", th->thread_id, th->state);
+-		for (int i = 0; i < (is_main ? depth : (depth < 6 ? depth : 6)); i++) {
+-			kprintf(" %08x", (uint32_t)pcs[i]);
++		/* Short lines: the negroni panel has a dead stripe right of ~column 60. */
++		if (is_main) {
++			found_main = 1;
++			kprintf("NEGRONI BT MAIN tid %llu st %x\n", th->thread_id, th->state);
++			for (int i = 0; i < depth; i++) {
++				kprintf("NEGRONI BT %d %08x\n", i, (uint32_t)pcs[i]);
++			}
++		}
++	}
++	if (!found_main) {
++		kprintf("NEGRONI BT: no thread through PE_lockdown_iokit\n");
++		nth = 0;
++		queue_iterate(&kernel_task->threads, th, thread_t, task_threads) {
++			if (++nth > 96) {
++				break;
++			}
++			if (th == current_thread() || th->kernel_stack == 0) {
++				continue;
++			}
++			thread_kernel_state_t ks = (thread_kernel_state_t)th->machine.kstackptr;
++			uint64_t fp = ks->machine.ss.fp, lr1 = 0;
++			if (fp >= th->kernel_stack && fp + 16 <= th->kernel_stack + kernel_stack_size && (fp & 7) == 0) {
++				lr1 = ((uint64_t *)fp)[1];
++			}
++			kprintf("NEGRONI BT t%llu %08x %08x\n", th->thread_id, (uint32_t)ks->machine.ss.lr, (uint32_t)lr1);
++			if (oldest == THREAD_NULL || th->thread_id < oldest->thread_id) {
++				oldest = th;
++			}
++		}
++		/* The boot thread is the oldest kernel thread: its whole chain. */
++		if (oldest != THREAD_NULL) {
++			thread_kernel_state_t ks = (thread_kernel_state_t)oldest->machine.kstackptr;
++			uint64_t base = oldest->kernel_stack, top = base + kernel_stack_size;
++			int i = 0;
++			kprintf("NEGRONI BT OLDEST tid %llu st %x\n", oldest->thread_id, oldest->state);
++			kprintf("NEGRONI BT %d %08x\n", i++, (uint32_t)ks->machine.ss.lr);
++			for (uint64_t fp = ks->machine.ss.fp; i < 32 && fp >= base && fp + 16 <= top && (fp & 7) == 0; i++) {
++				kprintf("NEGRONI BT %d %08x\n", i, (uint32_t)((uint64_t *)fp)[1]);
++				uint64_t next = ((uint64_t *)fp)[0];
++				if (next <= fp) {
++					break;
++				}
++				fp = next;
++			}
+ 		}
+-		kprintf("\n");
+ 	}
+ }
+ #endif /* NEGRONI */

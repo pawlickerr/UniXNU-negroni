@@ -1,0 +1,71 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 2fdf12f..68d5505 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -354,6 +354,38 @@ negroni_draw_text_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uin
+ 	}
+ }
+ 
++/*
++ * negronifb_clockshift=N: move the left ear of the status bar (rows 0..N_ROWS, the
++ * left half: only the clock is there) N pixels to the right, so the clock clears the
++ * punch-hole camera; the rest of the picture is untouched. Done after each copy.
++ */
++static int negroni_clock_shift = -1;
++
++static void
++negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	const uint32_t rows = 150;
++
++	if (negroni_clock_shift < 0) {
++		negroni_clock_shift = 0;
++		PE_parse_boot_argn("negronifb_clockshift", &negroni_clock_shift, sizeof(negroni_clock_shift));
++		if (negroni_clock_shift < 0 || negroni_clock_shift > 400) {
++			negroni_clock_shift = 0;
++		}
++	}
++	uint32_t n = (uint32_t)negroni_clock_shift, half = width / 2;
++	if (n == 0 || n >= half || rows > height) {
++		return;
++	}
++	for (uint32_t y = 0; y < rows; y++) {
++		uint32_t *row = (uint32_t *)(pixels + (uint64_t)y * rowBytes);
++		memmove(row + n, row, (size_t)(half - n) * 4);
++		for (uint32_t x = 0; x < n; x++) {
++			row[x] = 0;
++		}
++	}
++}
++
+ static void
+ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
+ {
+@@ -365,6 +397,7 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	bool topRedrawn = false;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -444,6 +477,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
++				topRedrawn = true;      /* this frame rewrote the status bar's left ear */
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -452,6 +488,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (topRedrawn) {
++		negroni_shift_clock(fPixels, fRowBytes, fWidth, fHeight);
++	}
+ 	negroni_draw_badge(fPixels, fRowBytes, fWidth, fHeight);
+ }
+ 

@@ -1,0 +1,120 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index df96d03..ddfbe72 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -78,6 +78,14 @@ void negroni_adreno_init(void);
+ 
+ static uint32_t pause_ms = 500;
+ static uint32_t step;
++
++/*
++ * Status badge for the screen's top-right corner, drawn over every frame by
++ * NegroniFramebuffer (AppleCLCD::present): the text and its colour (xRGB).
++ */
++char negroni_gpu_badge[24] = "GPU OFF";
++uint32_t negroni_gpu_badge_color = 0x00606060;
++static bool gmu_counts;
+ static vm_offset_t gcc, gpucc, gmu;
+ 
+ /* Plain 32-bit loads and stores; the hypervisor's trap emulation copes with no other form. */
+@@ -232,6 +240,7 @@ gmu_words(void)
+ 		last = rd(gmu + GMU_REG(GMU_AO_COUNTER_L));
+ 		printf("NEGRONI ADRENO: %u GMU AO counter low = %#x\n", step, last);
+ 	}
++	gmu_counts = last != first;
+ 	printf("NEGRONI ADRENO: %u GMU AO counter %s; CM3_FW_INIT_RESULT = %#x, CM3_SYSRESET = %#x\n", step,
+ 	    last != first ? "COUNTS" : "does not count",
+ 	    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)), rd(gmu + GMU_REG(GMU_CM3_SYSRESET)));
+@@ -339,15 +348,30 @@ negroni_adreno_init(void)
+ 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
+ 	gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
+ 	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
++	bool failed = false;
+ 	for (step = 1; step <= last; step++) {
++		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU %u", step);
++		negroni_gpu_badge_color = 0x00d0a000;
+ 		if (step >= 2 && !cfg_ahb_running()) {
+ 			printf("NEGRONI ADRENO: %u stop: GCC_GPU_CFG_AHB_CLK is off\n", step);
++			failed = true;
+ 			break;
+ 		}
+ 		if (!steps[step - 1]()) {
++			failed = true;
+ 			break;
+ 		}
+ 	}
++	if (failed) {
++		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU STOP %u", step);
++		negroni_gpu_badge_color = 0x00c00000;
++	} else if (gmu_counts) {
++		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU ON");
++		negroni_gpu_badge_color = 0x0000a000;
++	} else {
++		snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU %u OK", last);
++		negroni_gpu_badge_color = 0x00d0a000;
++	}
+ 	printf("NEGRONI ADRENO: done (asked %u, reached %u)\n", last, MIN(step, last));
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 953e6c3..de9ee27 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "NegroniSurface.h"
+ 
+ extern "C" int negroni_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" char negroni_gpu_badge[24];   /* bsd/dev/negroni_adreno.c */
++extern "C" uint32_t negroni_gpu_badge_color;
++extern "C" unsigned char iso_font[256 * 16];
+ 
+ #if defined(NEGRONI)
+ #include <IOKit/IOService.h>
+@@ -308,6 +311,39 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * GPU status badge in the top-right corner (negroni_adreno.c sets text and
++ * colour): white 8x16 console glyphs at 3x on a coloured box, drawn last so
++ * every frame iOS presents carries it.
++ */
++static void
++negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	const int scale = 3, pad = 12, top = 96;
++	size_t n = strnlen(negroni_gpu_badge, sizeof(negroni_gpu_badge));
++	int bw = (int)n * 8 * scale + 2 * pad, bh = 16 * scale + 2 * pad;
++	int x0 = (int)width - bw - 24;
++
++	if (x0 < 0 || top + bh > (int)height) {
++		return;
++	}
++	for (int y = 0; y < bh; y++) {
++		uint32_t *row = (uint32_t *)(pixels + (uint64_t)(top + y) * rowBytes) + x0;
++		for (int x = 0; x < bw; x++) {
++			uint32_t c = negroni_gpu_badge_color;
++			int gx = x - pad, gy = y - pad;
++			if (gx >= 0 && gy >= 0 && gy < 16 * scale && gx < (int)n * 8 * scale) {
++				unsigned char ch = (unsigned char)negroni_gpu_badge[gx / (8 * scale)];
++				unsigned char bits = iso_font[ch * 16 + gy / scale];
++				if (bits & (1u << ((gx / scale) % 8))) {
++					c = 0x00ffffff;
++				}
++			}
++			row[x] = c;
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -399,6 +435,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	negroni_draw_badge(fPixels, fRowBytes, fWidth, fHeight);
+ }
+ 
+ bool

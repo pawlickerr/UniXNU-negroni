@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/negroni_cpufreq.c b/bsd/dev/negroni_cpufreq.c
+index ec07107..5cef207 100644
+--- a/bsd/dev/negroni_cpufreq.c
++++ b/bsd/dev/negroni_cpufreq.c
+@@ -9,7 +9,9 @@
+  * Linux qcom-cpufreq-hw EPSS layout.
+  *
+  * Boot args: negronicpufreq=0 leaves the clocks alone; negronicpufreq_mhz=N
+- * caps each domain at the highest row not above N MHz (default 2400).
++ * caps each domain at the highest row not above N MHz (default 3200,
++ * above every row: the top of each table); a domain is never set below
++ * the row ABL left it at.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -62,6 +64,12 @@ raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
+ 		top_khz = khz;
+ 	}
+ 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
++	if (was >= top) {
++		/* ABL already asked for as much or more: never slow a domain down */
++		printf("NEGRONI CPUFREQ: domain %u (%u cores): keeping row %u (cap row %u, %u MHz)\n",
++		    domain, cores, was, top, top_khz / 1000);
++		return;
++	}
+ 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
+ 	delay(20000);
+ 	printf("NEGRONI CPUFREQ: domain %u (%u cores): row %u -> %u, %u MHz\n",
+@@ -72,7 +80,7 @@ void
+ negroni_cpufreq_init(void)
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+-	uint32_t enabled = 1, cap_mhz = 2400, cores[EPSS_DOMAINS] = { 0 };
++	uint32_t enabled = 1, cap_mhz = 3200, cores[EPSS_DOMAINS] = { 0 };
+ 
+ 	(void)PE_parse_boot_argn("negronicpufreq", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("negronicpufreq_mhz", &cap_mhz, sizeof(cap_mhz));

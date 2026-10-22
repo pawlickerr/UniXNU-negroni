@@ -1,0 +1,422 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 7b6dd9b..df96d03 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -8,10 +8,19 @@
+  * Boot arg negroniadreno=N performs steps 1..N (default 0: nothing).
+  *   1  reads   GCC branches that feed the GPU (CFG AHB, MEMNOC GFX, SNOC DVM, DDRSS GPU AXI)
+  *   2  reads   GPUCC: CX/GX GDSC state and the CX-side clocks, only when CFG AHB runs
+- *   3  reads   GMU CX registers (needs CX GDSC on and the GMU clock): AO counter, GMU state
++ *   3  reads   GMU CX registers, only if CX and the GMU clock are already on
++ *   4  writes  the CX GDSC on (clears SW_COLLAPSE, waits for PWR_ON)
++ *   5  writes  GCC: GPLL0 GPU taps voted, MEMNOC/SNOC DVM/DDRSS GPU AXI on;
++ *              GPUCC: GMU clock 200 MHz and hub 150 MHz from the GPLL0 300 MHz tap,
++ *              then the CX clocks (AHB, CXO, hub AON, hub CX int, CX GMU, SMMU vote)
++ *   6  reads   the GMU's first words: the always-on counter must count
++ * negroniadreno_pause=MS waits after each announcement (default 500), so the
++ * persistent log has the line before a silent reset.
+  *
+  * Addresses: sm8450.dtsi (gpu@3d00000, gmu@3d6a000, gpucc@3d90000,
+- * gcc@100000); offsets: Linux gcc-sm8450.c, gpucc-sm8450.c, a6xx_gmu.xml.
++ * gcc@100000); offsets: Linux gcc-sm8450.c, gpucc-sm8450.c, gdsc.c,
++ * clk-rcg2.c, a6xx_gmu.xml. The GPU block is left powered when the ladder
++ * ends (nothing else uses it yet).
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -31,12 +40,47 @@ void negroni_adreno_init(void);
+ #define GPU_PHYS        0x03d00000UL
+ #define GMU_REG(dw)     ((vm_offset_t)(dw) * 4 - (GMU_PHYS - GPU_PHYS))
+ 
+-#define BRANCH_CLK_OFF  (1u << 31)      /* CBCR: the clock is not running */
+-#define GDSC_PWR_ON     (1u << 31)      /* GDSCR: the domain is powered */
++/* GCC */
++#define GCC_GPU_CFG_AHB_CBCR    0x81004
++#define GCC_GPU_MEMNOC_GFX_CBCR 0x81010
++#define GCC_GPU_SNOC_DVM_CBCR   0x81018
++#define GCC_DDRSS_GPU_AXI_CBCR  0x81154
++#define GCC_PLL_VOTE            0x62000         /* gcc_gpu_gpll0_clk_src BIT(15), _div_ BIT(16) */
++#define GCC_PLL_VOTE_GPU        ((1u << 15) | (1u << 16))
++
++/* GPUCC */
++#define GPUCC_GX_GDSCR          0x905c
++#define GPUCC_CX_GDSCR          0x9108
++#define GPUCC_AHB_CBCR          0x911c
++#define GPUCC_CX_SNOC_DVM_CBCR  0x9130
++#define GPUCC_CX_GMU_CBCR       0x913c
++#define GPUCC_CXO_CBCR          0x9144
++#define GPUCC_HUB_CX_INT_CBCR   0x9148
++#define GPUCC_MEMNOC_GFX_CBCR   0x9150
++#define GPUCC_HUB_AON_CBCR      0x93e8
++#define GPUCC_SMMU_VOTE_CBCR    0x7000
++#define GPUCC_GMU_RCGR          0x9318
++#define GPUCC_HUB_RCGR          0x93ec
++
++#define CBCR_ENABLE             (1u << 0)
++#define CBCR_OFF                (1u << 31)      /* CBCR: the clock is not running */
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_HW_CONTROL         (1u << 1)
++#define GDSC_PWR_ON             (1u << 31)      /* GDSCR: the domain is powered */
++#define RCG_UPDATE              (1u << 0)       /* CMD_RCGR: take the new source and divider */
++#define RCG_SOURCE_MASK         0x371fu         /* CFG: [4:0] 2*div-1, [10:8] source, [13:12] mode */
++#define RCG_GPLL0_DIV(twice)    (6u << 8 | ((twice) - 1))       /* source 6: GPLL0 out main div, 300 MHz */
++
++/* GMU CX (a6xx_gmu.xml dword offsets from the GPU base) */
++#define GMU_AO_COUNTER_L        0x1f888
++#define GMU_CM3_SYSRESET        0x1f800
++#define GMU_CM3_FW_INIT_RESULT  0x1f81c
+ 
+ static uint32_t pause_ms = 500;
++static uint32_t step;
++static vm_offset_t gcc, gpucc, gmu;
+ 
+-/* A plain 32-bit load; the hypervisor's trap emulation copes with no other form. */
++/* Plain 32-bit loads and stores; the hypervisor's trap emulation copes with no other form. */
+ static uint32_t __attribute__((noinline))
+ rd(vm_offset_t address)
+ {
+@@ -46,109 +90,264 @@ rd(vm_offset_t address)
+ 	return value;
+ }
+ 
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
+ static void
+ announce(const char *what)
+ {
+-	printf("NEGRONI ADRENO: about to read %s\n", what);
++	printf("NEGRONI ADRENO: %u about to %s\n", step, what);
+ 	delay(pause_ms * 1000);
+ }
+ 
+-static const struct {
+-	const char *name;
+-	uint32_t offset;
+-} gcc_branches[] = {
+-	{ "GCC_GPU_CFG_AHB_CLK", 0x81004 },
+-	{ "GCC_GPU_MEMNOC_GFX_CLK", 0x81010 },
+-	{ "GCC_GPU_SNOC_DVM_GFX_CLK", 0x81018 },
+-	{ "GCC_DDRSS_GPU_AXI_CLK", 0x81154 },
+-};
++static void
++put(vm_offset_t base, const char *name, uint32_t offset, uint32_t value)
++{
++	uint32_t was = rd(base + offset);
++
++	wr(base + offset, value);
++	printf("NEGRONI ADRENO: %u %s %#x -> %#x (reads %#x)\n", step, name, was, value, rd(base + offset));
++}
++
++/* Wait up to `ms` for (reg & mask) == want. */
++static bool
++wait_for(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if ((rd(address) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return (rd(address) & mask) == want;
++}
++
++static bool
++clock_on(vm_offset_t base, const char *name, uint32_t cbcr, bool must)
++{
++	put(base, name, cbcr, rd(base + cbcr) | CBCR_ENABLE);
++	if (wait_for(base + cbcr, CBCR_OFF, 0, 10)) {
++		return true;
++	}
++	/* Some branches' status bits are not reliable (halt_check in Linux): `must` says which count. */
++	printf("NEGRONI ADRENO: %u %s stays off (%#x)%s\n", step, name, rd(base + cbcr),
++	    must ? "" : ", not a reliable status bit, going on");
++	return !must;
++}
++
++static bool
++clock_source(const char *name, uint32_t rcgr, uint32_t source)
++{
++	uint32_t cfg = rd(gpucc + rcgr + 4);
++
++	if ((cfg & RCG_SOURCE_MASK) == source) {
++		printf("NEGRONI ADRENO: %u %s already at %#x\n", step, name, cfg);
++		return true;
++	}
++	put(gpucc, name, rcgr + 4, (cfg & ~RCG_SOURCE_MASK) | source);
++	put(gpucc, name, rcgr, rd(gpucc + rcgr) | RCG_UPDATE);
++	if (!wait_for(gpucc + rcgr, RCG_UPDATE, 0, 10)) {
++		printf("NEGRONI ADRENO: %u %s does not take its new source (cmd %#x)\n", step, name, rd(gpucc + rcgr));
++		return false;
++	}
++	return true;
++}
++
++static bool
++cfg_ahb_running(void)
++{
++	return !(rd(gcc + GCC_GPU_CFG_AHB_CBCR) & CBCR_OFF);
++}
++
++static bool
++cx_is_on(void)
++{
++	return (rd(gpucc + GPUCC_CX_GDSCR) & GDSC_PWR_ON) != 0;
++}
++
++/* ---- the steps ---- */
++
++static bool
++step_gcc(void)
++{
++	static const struct { const char *name; uint32_t offset; } r[] = {
++		{ "GCC_GPU_CFG_AHB_CLK", GCC_GPU_CFG_AHB_CBCR },
++		{ "GCC_GPU_MEMNOC_GFX_CLK", GCC_GPU_MEMNOC_GFX_CBCR },
++		{ "GCC_GPU_SNOC_DVM_GFX_CLK", GCC_GPU_SNOC_DVM_CBCR },
++		{ "GCC_DDRSS_GPU_AXI_CLK", GCC_DDRSS_GPU_AXI_CBCR },
++		{ "GCC_PLL_VOTE", GCC_PLL_VOTE },
++	};
++
++	announce("read GCC GPU branches");
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		uint32_t v = rd(gcc + r[i].offset);
++		printf("NEGRONI ADRENO: 1 %s = %#x%s\n", r[i].name, v,
++		    r[i].offset == GCC_PLL_VOTE ? "" : (v & CBCR_OFF) ? " (off)" : " (running)");
++	}
++	if (!cfg_ahb_running()) {
++		printf("NEGRONI ADRENO: 1 stop: GCC_GPU_CFG_AHB_CLK is off, GPUCC unreachable\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_gpucc_read(void)
++{
++	static const struct { const char *name; uint32_t offset; bool gdsc; } r[] = {
++		{ "GPU_CX_GDSC", GPUCC_CX_GDSCR, true },
++		{ "GPU_GX_GDSC", GPUCC_GX_GDSCR, true },
++		{ "GPU_CC_AHB_CLK", GPUCC_AHB_CBCR, false },
++		{ "GPU_CC_CX_GMU_CLK", GPUCC_CX_GMU_CBCR, false },
++		{ "GPU_CC_CXO_CLK", GPUCC_CXO_CBCR, false },
++		{ "GPU_CC_HUB_CX_INT_CLK", GPUCC_HUB_CX_INT_CBCR, false },
++		{ "GPU_CC_HUB_AON_CLK", GPUCC_HUB_AON_CBCR, false },
++		{ "GPU_CC_MEMNOC_GFX_CLK", GPUCC_MEMNOC_GFX_CBCR, false },
++		{ "GPU_CC_CX_SNOC_DVM_CLK", GPUCC_CX_SNOC_DVM_CBCR, false },
++		{ "GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK", GPUCC_SMMU_VOTE_CBCR, false },
++	};
++
++	announce("read GPUCC (GDSCs and CX clocks)");
++	for (unsigned i = 0; i < sizeof(r) / sizeof(r[0]); i++) {
++		uint32_t v = rd(gpucc + r[i].offset);
++		printf("NEGRONI ADRENO: 2 %s = %#x (%s)\n", r[i].name, v,
++		    r[i].gdsc ? ((v & GDSC_PWR_ON) ? "powered" : "off") : ((v & CBCR_OFF) ? "off" : "running"));
++	}
++	printf("NEGRONI ADRENO: 2 GMU RCG cmd %#x cfg %#x, hub RCG cmd %#x cfg %#x\n",
++	    rd(gpucc + GPUCC_GMU_RCGR), rd(gpucc + GPUCC_GMU_RCGR + 4),
++	    rd(gpucc + GPUCC_HUB_RCGR), rd(gpucc + GPUCC_HUB_RCGR + 4));
++	return true;
++}
++
++static void
++gmu_words(void)
++{
++	uint32_t first = rd(gmu + GMU_REG(GMU_AO_COUNTER_L)), last = first;
++
++	for (int i = 0; i < 3; i++) {
++		delay(1000);
++		last = rd(gmu + GMU_REG(GMU_AO_COUNTER_L));
++		printf("NEGRONI ADRENO: %u GMU AO counter low = %#x\n", step, last);
++	}
++	printf("NEGRONI ADRENO: %u GMU AO counter %s; CM3_FW_INIT_RESULT = %#x, CM3_SYSRESET = %#x\n", step,
++	    last != first ? "COUNTS" : "does not count",
++	    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)), rd(gmu + GMU_REG(GMU_CM3_SYSRESET)));
++}
++
++static bool
++step_gmu_read_if_on(void)
++{
++	if (!cx_is_on() || (rd(gpucc + GPUCC_CX_GMU_CBCR) & CBCR_OFF)) {
++		printf("NEGRONI ADRENO: 3 CX or the GMU clock is off: nothing to read yet (steps 4 and 5 switch them on)\n");
++		return true;
++	}
++	announce("read GMU CX registers");
++	gmu_words();
++	return true;
++}
+ 
+-static const struct {
+-	const char *name;
+-	uint32_t offset;
+-} gpucc_regs[] = {
+-	{ "GPU_CX_GDSC", 0x9108 },
+-	{ "GPU_GX_GDSC", 0x905c },
+-	{ "GPU_CC_AHB_CLK", 0x911c },
+-	{ "GPU_CC_CX_GMU_CLK", 0x913c },
+-	{ "GPU_CC_CXO_CLK", 0x9144 },
+-	{ "GPU_CC_HUB_CX_INT_CLK", 0x9148 },
+-	{ "GPU_CC_MEMNOC_GFX_CLK", 0x9150 },
+-	{ "GPU_CC_CX_SNOC_DVM_CLK", 0x9130 },
+-	{ "GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK", 0x7000 },
+-	{ "GPU_CC_GMU_CLK_SRC (CMD)", 0x9318 },
++static bool
++step_cx_power(void)
++{
++	uint32_t gdscr = rd(gpucc + GPUCC_CX_GDSCR);
++
++	if (cx_is_on()) {
++		printf("NEGRONI ADRENO: 4 CX is on already (%#x)\n", gdscr);
++		return true;
++	}
++	if (gdscr & GDSC_HW_CONTROL) {
++		printf("NEGRONI ADRENO: 4 stop: CX GDSC is under hardware control (%#x)\n", gdscr);
++		return false;
++	}
++	announce("switch the CX GDSC on (clear SW_COLLAPSE)");
++	put(gpucc, "GPU_CX_GDSCR", GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++	if (!wait_for(gpucc + GPUCC_CX_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON, 50)) {
++		printf("NEGRONI ADRENO: 4 stop: CX does not come on (%#x)\n", rd(gpucc + GPUCC_CX_GDSCR));
++		return false;
++	}
++	printf("NEGRONI ADRENO: 4 CX is on (%#x)\n", rd(gpucc + GPUCC_CX_GDSCR));
++	if (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) {
++		/* A GX left on by an earlier run does not take commands, and switching it off hung the phone. */
++		printf("NEGRONI ADRENO: 4 stop: GX already has power (left by an earlier run): restart the phone\n");
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_clocks(void)
++{
++	if (!cx_is_on()) {
++		printf("NEGRONI ADRENO: 5 stop: CX is off (step 4)\n");
++		return false;
++	}
++	announce("vote the GPLL0 GPU taps and switch the GCC GPU clocks on");
++	put(gcc, "GCC_PLL_VOTE", GCC_PLL_VOTE, rd(gcc + GCC_PLL_VOTE) | GCC_PLL_VOTE_GPU);
++	if (!clock_on(gcc, "GCC_GPU_MEMNOC_GFX_CLK", GCC_GPU_MEMNOC_GFX_CBCR, false) ||
++	    !clock_on(gcc, "GCC_GPU_SNOC_DVM_GFX_CLK", GCC_GPU_SNOC_DVM_CBCR, true) ||
++	    !clock_on(gcc, "GCC_DDRSS_GPU_AXI_CLK", GCC_DDRSS_GPU_AXI_CBCR, false)) {
++		return false;
++	}
++	announce("set the GMU clock to 200 MHz and the hub clock to 150 MHz (GPLL0 300 MHz tap)");
++	if (!clock_source("GPU_CC_GMU_CLK_SRC", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3)) ||
++	    !clock_source("GPU_CC_HUB_CLK_SRC", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4))) {
++		return false;
++	}
++	announce("switch the GPUCC CX clocks on");
++	if (!clock_on(gpucc, "GPU_CC_AHB_CLK", GPUCC_AHB_CBCR, false) ||
++	    !clock_on(gpucc, "GPU_CC_CXO_CLK", GPUCC_CXO_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_HUB_AON_CLK", GPUCC_HUB_AON_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_HUB_CX_INT_CLK", GPUCC_HUB_CX_INT_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_CX_GMU_CLK", GPUCC_CX_GMU_CBCR, true) ||
++	    !clock_on(gpucc, "GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK", GPUCC_SMMU_VOTE_CBCR, false)) {
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_gmu_first_words(void)
++{
++	if (!cx_is_on() || (rd(gpucc + GPUCC_CX_GMU_CBCR) & CBCR_OFF)) {
++		printf("NEGRONI ADRENO: 6 stop: CX or the GMU clock is off (steps 4, 5)\n");
++		return false;
++	}
++	announce("read the GMU's first words");
++	gmu_words();
++	return true;
++}
++
++static bool (*const steps[])(void) = {
++	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
+ };
+ 
+ void
+ negroni_adreno_init(void)
+ {
+-	uint32_t last = 0, v;
+-	vm_offset_t gcc, gpucc, gmu;
+-	bool cx_on = false, gmu_clk = false;
++	uint32_t last = 0;
+ 
+ 	(void)PE_parse_boot_argn("negroniadreno", &last, sizeof(last));
+ 	(void)PE_parse_boot_argn("negroniadreno_pause", &pause_ms, sizeof(pause_ms));
+ 	if (last == 0) {
+ 		return;
+ 	}
++	last = MIN(last, (uint32_t)(sizeof(steps) / sizeof(steps[0])));
+ 	printf("NEGRONI ADRENO: steps 1..%u\n", last);
+-
+-	/* 1: GCC */
+-	announce("GCC GPU branches");
+ 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
+-	bool ahb_on = false;
+-	for (unsigned i = 0; i < sizeof(gcc_branches) / sizeof(gcc_branches[0]); i++) {
+-		v = rd(gcc + gcc_branches[i].offset);
+-		printf("NEGRONI ADRENO: 1 %s = %#x (%s)\n", gcc_branches[i].name, v,
+-		    (v & BRANCH_CLK_OFF) ? "off" : "running");
+-		if (i == 0) {
+-			ahb_on = !(v & BRANCH_CLK_OFF);
+-		}
+-	}
+-	if (last < 2) {
+-		goto done;
+-	}
+-	if (!ahb_on) {
+-		printf("NEGRONI ADRENO: 2 stop: GCC_GPU_CFG_AHB_CLK is off, GPUCC unreachable\n");
+-		goto done;
+-	}
+-
+-	/* 2: GPUCC */
+-	announce("GPUCC (GDSCs and CX clocks)");
+ 	gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
+-	for (unsigned i = 0; i < sizeof(gpucc_regs) / sizeof(gpucc_regs[0]); i++) {
+-		v = rd(gpucc + gpucc_regs[i].offset);
+-		bool gdsc = i < 2;
+-		printf("NEGRONI ADRENO: 2 %s = %#x (%s)\n", gpucc_regs[i].name, v,
+-		    gdsc ? ((v & GDSC_PWR_ON) ? "powered" : "off") : ((v & BRANCH_CLK_OFF) ? "off" : "running"));
+-		if (i == 0) {
+-			cx_on = (v & GDSC_PWR_ON) != 0;
++	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
++	for (step = 1; step <= last; step++) {
++		if (step >= 2 && !cfg_ahb_running()) {
++			printf("NEGRONI ADRENO: %u stop: GCC_GPU_CFG_AHB_CLK is off\n", step);
++			break;
+ 		}
+-		if (i == 3) {
+-			gmu_clk = !(v & BRANCH_CLK_OFF);
++		if (!steps[step - 1]()) {
++			break;
+ 		}
+ 	}
+-	if (last < 3) {
+-		goto done;
+-	}
+-	if (!cx_on || !gmu_clk) {
+-		printf("NEGRONI ADRENO: 3 stop: CX GDSC %s, GMU clock %s (step 4 would switch them on)\n",
+-		    cx_on ? "on" : "off", gmu_clk ? "running" : "off");
+-		goto done;
+-	}
+-
+-	/* 3: GMU CX registers: a6xx_gmu.xml dword offsets count from the GPU base 0x3d00000 */
+-	announce("GMU CX registers");
+-	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
+-	for (int i = 0; i < 3; i++) {
+-		uint32_t lo = rd(gmu + GMU_REG(0x1f888));        /* GMU_CX_GMU_ALWAYS_ON_COUNTER_L */
+-		printf("NEGRONI ADRENO: 3 GMU AO counter low = %#x\n", lo);
+-		delay(1000);
+-	}
+-	printf("NEGRONI ADRENO: 3 GMU_CM3_FW_INIT_RESULT = %#x, GMU_CM3_SYSRESET = %#x\n",
+-	    rd(gmu + GMU_REG(0x1f81c)), rd(gmu + GMU_REG(0x1f800)));
+-
+-done:
+-	printf("NEGRONI ADRENO: done (step %u)\n", last);
++	printf("NEGRONI ADRENO: done (asked %u, reached %u)\n", last, MIN(step, last));
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */

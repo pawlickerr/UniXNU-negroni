@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 5c5437a..670d826 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -387,9 +387,19 @@ negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_
+ 	}
+ }
+ 
++static int negroni_badges = -1;
++
++/* The GPU / Wi-Fi status badges are drawn only with boot-arg negronibadge=1. */
+ static void
+ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
+ {
++	if (negroni_badges < 0) {
++		negroni_badges = 0;
++		PE_parse_boot_argn("negronibadge", &negroni_badges, sizeof(negroni_badges));
++	}
++	if (!negroni_badges) {
++		return;
++	}
+ 	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_gpu_badge, negroni_gpu_badge_color, 96);
+ 	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_wifi_badge, negroni_wifi_badge_color, 96 + 84);
+ }

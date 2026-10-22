@@ -1,0 +1,252 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 05e5485..d1c48fd 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -50,6 +50,7 @@ extern const void *negroni_fw_get(const char *name, uint32_t *size);
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);     /* osfmk/arm/pmap/pmap.h (pmap_paddr_t) */
+ void negroni_adreno_init(void);
++extern uint32_t negroni_probe_gpu;
+ 
+ #define GCC_PHYS        0x00100000UL
+ #define GCC_SIZE        0x1f4200UL
+@@ -1001,6 +1002,9 @@ negroni_adreno_init(void)
+ 	uint32_t last = 0;
+ 
+ 	(void)PE_parse_boot_argn("negroniadreno", &last, sizeof(last));
++	if (negroni_probe_gpu != ~0u) {
++		last = negroni_probe_gpu;       /* probe menu (negroni_keys.c) */
++	}
+ 	(void)PE_parse_boot_argn("negroniadreno_pause", &pause_ms, sizeof(pause_ms));
+ 	if (last == 0) {
+ 		return;
+diff --git a/bsd/dev/negroni_keys.c b/bsd/dev/negroni_keys.c
+index dadef49..627f244 100644
+--- a/bsd/dev/negroni_keys.c
++++ b/bsd/dev/negroni_keys.c
+@@ -76,6 +76,104 @@ keys_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++static int keys_opened = -1;
++
++static int
++keys_open(void)
++{
++	if (keys_opened >= 0) {
++		return keys_opened;
++	}
++	keys_arb.core = (volatile uint32_t *)ml_io_map(KEYS_CORE_PA, KEYS_CORE_SIZE);
++	keys_arb.obs = (volatile uint32_t *)ml_io_map(KEYS_OBS_PA, KEYS_OBS_SIZE);
++	keys_arb.ee = 0;
++	if (!keys_arb.core || !keys_arb.obs) {
++		printf("NEGRONI KEYS: MMIO mapping failed\n");
++		return keys_opened = 1;
++	}
++	int rc = sk_open(&keys_arb, &keys_apid);
++	printf("NEGRONI KEYS: arb=%#x pon-apid=%d gpio6-apid=%d open=%d\n",
++	    keys_arb.core[0], keys_apid.pon, keys_apid.gpio, rc);
++	if (rc) {
++		printf("NEGRONI KEYS: arbiter or PON not found, keys off\n");
++	}
++	return keys_opened = rc ? 1 : 0;
++}
++
++/*
++ * Probe menu, before the key thread starts (one reader of the observer channel at a time):
++ * hold Volume Up during the prompt to open it. Volume Up raises the selected count,
++ * Volume Down selects the other one, Power runs. The counts replace negroniadreno /
++ * negroniwifi for this boot (negroni_adreno.c, negroni_wifi.c read negroni_probe_*).
++ */
++uint32_t negroni_probe_gpu = ~0u, negroni_probe_wifi = ~0u;
++void negroni_probe_menu(void);
++
++#define PROBE_GPU_MAX   14
++#define PROBE_WIFI_MAX  4
++
++static uint8_t
++keys_now(void)
++{
++	uint8_t pressed = 0;
++	return sk_sample(&keys_arb, &keys_apid, &pressed) ? 0 : pressed;
++}
++
++void
++negroni_probe_menu(void)
++{
++	uint32_t value[2] = { 0, 0 }, field = 0, menu = 1;
++	uint8_t was;
++
++	(void)PE_parse_boot_argn("negronimenu", &menu, sizeof(menu));
++	if (!menu || keys_open()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("negroniadreno", &value[0], sizeof(value[0]));
++	(void)PE_parse_boot_argn("negroniwifi", &value[1], sizeof(value[1]));
++	printf("\nNEGRONI PROBE MENU: hold VOLUME UP now to open it (2 s)\n");
++	bool open = false;
++	for (int i = 0; i < 100 && !open; i++) {
++		open = (keys_now() & SK_KEY_VOLUP) != 0;
++		delay(20000);
++	}
++	if (!open) {
++		return;
++	}
++	printf("NEGRONI PROBE MENU: VOL+ = +1, VOL- = switch GPU/WIFI, POWER = run (60 s timeout)\n");
++	while (keys_now() & SK_KEY_VOLUP) {
++		delay(20000);
++	}
++	was = 0;
++	for (int ticks = 0; ticks < 3000; ticks++) {
++		uint8_t now = keys_now(), edge = now & ~was;
++		was = now;
++		if (ticks == 0 || edge) {
++			if (edge & SK_KEY_VOLUP) {
++				uint32_t max = field ? PROBE_WIFI_MAX : PROBE_GPU_MAX;
++				value[field] = value[field] >= max ? 0 : value[field] + 1;
++			}
++			if (edge & SK_KEY_VOLDOWN) {
++				field ^= 1;
++			}
++			if (edge & SK_KEY_POWER) {
++				break;
++			}
++			printf("NEGRONI PROBE MENU: %sGPU steps %u%s   %sWIFI steps %u%s\n",
++			    field ? " " : "[", value[0], field ? " " : "]",
++			    field ? "[" : " ", value[1], field ? "]" : " ");
++			ticks = 0;
++		}
++		delay(20000);
++	}
++	negroni_probe_gpu = value[0];
++	negroni_probe_wifi = value[1];
++	printf("NEGRONI PROBE MENU: running GPU steps 1..%u, WIFI steps 1..%u\n", value[0], value[1]);
++	while (keys_now() & SK_KEY_POWER) {
++		delay(20000);
++	}
++}
++
+ void
+ negroni_keys_init(void)
+ {
+@@ -91,18 +189,7 @@ negroni_keys_init(void)
+ 		printf("NEGRONI KEYS: disabled (negronikeys=0)\n");
+ 		return;
+ 	}
+-	keys_arb.core = (volatile uint32_t *)ml_io_map(KEYS_CORE_PA, KEYS_CORE_SIZE);
+-	keys_arb.obs = (volatile uint32_t *)ml_io_map(KEYS_OBS_PA, KEYS_OBS_SIZE);
+-	keys_arb.ee = 0;
+-	if (!keys_arb.core || !keys_arb.obs) {
+-		printf("NEGRONI KEYS: MMIO mapping failed\n");
+-		return;
+-	}
+-	int rc = sk_open(&keys_arb, &keys_apid);
+-	printf("NEGRONI KEYS: arb=%#x pon-apid=%d gpio6-apid=%d open=%d\n",
+-	    keys_arb.core[0], keys_apid.pon, keys_apid.gpio, rc);
+-	if (rc) {
+-		printf("NEGRONI KEYS: arbiter or PON not found, keys off\n");
++	if (keys_open()) {
+ 		return;
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 33468d6..2508cb8 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -56,6 +56,7 @@ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
++extern void negroni_probe_menu(void);
+ extern void negroni_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -738,6 +739,7 @@ negroni_ufs_init(void)
+ 	negroni_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
+ 	negroni_cpufreq_init();
++	negroni_probe_menu();
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
+ 	negroni_keys_init();
+diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
+index a068ce9..72189fe 100644
+--- a/bsd/dev/negroni_wifi.c
++++ b/bsd/dev/negroni_wifi.c
+@@ -22,6 +22,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int negroni_rpmh_lookup(const char *res, uint32_t *address);
+ void negroni_wifi_init(void);
++extern uint32_t negroni_probe_wifi;
+ 
+ /* corner badge, second line (NegroniFramebuffer) */
+ char negroni_wifi_badge[24] = "";
+@@ -150,6 +151,9 @@ negroni_wifi_init(void)
+ 	bool failed = false;
+ 
+ 	(void)PE_parse_boot_argn("negroniwifi", &last, sizeof(last));
++	if (negroni_probe_wifi != ~0u) {
++		last = negroni_probe_wifi;      /* probe menu (negroni_keys.c) */
++	}
+ 	(void)PE_parse_boot_argn("negroniwifi_pause", &pause_ms, sizeof(pause_ms));
+ 	if (last == 0) {
+ 		return;
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index d8cdd6c..2fdf12f 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -181,6 +181,13 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/* negronifb_shift=N: move the picture N panel pixels down, so the status bar (the clock in
++	 * the top-left ear) clears the punch-hole camera; the bottom rows are cut instead. */
++	int shift = 0;
++	PE_parse_boot_argn("negronifb_shift", &shift, sizeof(shift));
++	if (shift > 0 && shift < 300) {
++		fOffY -= shift;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = negroni_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, NEGRONI_FB_FORMAT_BGRA);
+diff --git a/iokit/Kernel/arm/hid/NegroniHID.cpp b/iokit/Kernel/arm/hid/NegroniHID.cpp
+index 4db0a76..eb28388 100644
+--- a/iokit/Kernel/arm/hid/NegroniHID.cpp
++++ b/iokit/Kernel/arm/hid/NegroniHID.cpp
+@@ -367,7 +367,7 @@ protected:
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
+-	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fLogicalW, fLogicalH, fOffX, fOffY, fShift;
+ 	bool fDown[NEGRONI_TOUCH_FINGERS];
+ 	bool fEdge[NEGRONI_TOUCH_FINGERS];
+ 	IOFixed fX[NEGRONI_TOUCH_FINGERS];
+@@ -438,6 +438,13 @@ NegroniHIDTouch::start(IOService *provider)
+ 	fLogicalH = native ? 2412 : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - 2412) / 2;
++	/* negronifb_shift (NegroniFramebuffer.cpp): the picture sits N pixels lower on the panel. */
++	fShift = 0;
++	PE_parse_boot_argn("negronifb_shift", &fShift, sizeof(fShift));
++	if (fShift <= 0 || fShift >= 300) {
++		fShift = 0;
++	}
++	fOffY -= fShift;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -465,7 +472,12 @@ NegroniHIDTouch::touch(int finger, bool down, int x, int y)
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (NegroniFramebuffer.cpp). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	int ly = y + fOffY;
++	if (fShift && y >= 2412 - 24) {
++		ly = (int)fLogicalH - 1;        /* the cut-off bottom: keep the home swipe's edge reachable */
++	}
++	ly = ly < 0 ? 0 : (ly > (int)fLogicalH - 1 ? (int)fLogicalH - 1 : ly);
++	IOFixed ny = (IOFixed)(((int64_t)ly << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);

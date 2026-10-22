@@ -1,0 +1,32 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 1fb629e..4769bdd 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -55,6 +55,7 @@
+ #include <machine/atomic.h>
+ #include <machine/limits.h>
+ 
++#include <pexpert/pexpert.h>
+ #include <pexpert/arm/protos.h>
+ #include <pexpert/arm64/apple_arm64_regs.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -1962,9 +1963,17 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+-	/* Bring-up trace: timer IRQs at powers of two, the first other IRQs. */
++	/* Bring-up trace (boot-arg negronitrace=1): timer IRQs at powers of two, the first other IRQs. */
+ 	static uint32_t negroni_vtimer_irqs, negroni_other_irqs;
+-	if (intid == negroni_vtimer_intid) {
++	static int negroni_trace = -1;
++	if (negroni_trace < 0) {
++		int on = 0;
++		(void)PE_parse_boot_argn("negronitrace", &on, sizeof(on));
++		negroni_trace = on != 0;
++	}
++	if (!negroni_trace) {
++		/* off */
++	} else if (intid == negroni_vtimer_intid) {
+ 		uint32_t n = ++negroni_vtimer_irqs;
+ 		if ((n & (n - 1)) == 0) {
+ 			kprintf("NEGRONI VTIMER irq %u tval %lld\n", n, (long long)(int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0"));

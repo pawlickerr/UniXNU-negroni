@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index cb9100b..51d6048 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -1762,12 +1762,39 @@ step_zap_and_secure(void)
+ 		printf("NEGRONI ADRENO: 21 stop: the command processor does not run (step 20)\n");
+ 		return false;
+ 	}
++	/*
++	 * qcom_mdt_pas_init / qcom_mdt_load: the PT_LOAD segments go at (p_paddr - lowest p_paddr) in the
++	 * reserved memory, each from its own .bNN file; TrustZone is told the span from the lowest
++	 * address to the highest end rounded up to 4K. On the A730 zap that is segment 1 (.b01).
++	 */
++	uint32_t min_pa = ~0u, max_pa = 0, nseg;
+ 	mdt = negroni_fw_get("a730_zap.mdt", &mdt_size);
+-	seg = negroni_fw_get("a730_zap.b02", &seg_size);
+-	if (mdt == NULL || seg == NULL || mdt_size > PAGE_SIZE || seg_size > ZAP_MEMORY_SIZE) {
+-		printf("NEGRONI ADRENO: 21 stop: zap files missing or too large\n");
++	if (mdt == NULL || mdt_size < 52 || mdt_size > PAGE_SIZE || memcmp(mdt, "\177ELF\1", 5) != 0) {
++		printf("NEGRONI ADRENO: 21 stop: no usable a730_zap.mdt\n");
+ 		return false;
+ 	}
++	uint32_t phoff;
++	memcpy(&phoff, mdt + 28, 4);
++	nseg = (uint32_t)(mdt[44] | mdt[45] << 8);
++	if (phoff + 32 * nseg > mdt_size || nseg > 16) {
++		printf("NEGRONI ADRENO: 21 stop: bad program header table\n");
++		return false;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		bool hash = ((ph[6] >> 24) & 7) == 2;
++		if (ph[0] != 1 || hash || ph[5] == 0) {
++			continue;
++		}
++		min_pa = MIN(min_pa, ph[3]);
++		max_pa = MAX(max_pa, (ph[3] + ph[5] + 0xfffu) & ~0xfffu);
++	}
++	if (min_pa == ~0u || max_pa - min_pa > ZAP_MEMORY_SIZE) {
++		printf("NEGRONI ADRENO: 21 stop: zap load range %#x..%#x does not fit\n", min_pa, max_pa);
++		return false;
++	}
++	printf("NEGRONI ADRENO: 21 zap: %u segments, load range %#x..%#x\n", nseg, min_pa, max_pa);
+ 	announce("ask TrustZone to drop a zap shader an earlier run may have left");
+ 	scm("PAS shutdown (zap)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer);
+ 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -1783,14 +1810,32 @@ step_zap_and_secure(void)
+ 	}
+ 	answer = ~0ull;
+ 	if (scm("PAS mem setup (zap)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY,
+-	    ZAP_MEMORY_SIZE, &answer) != 0 || answer != 0) {
++	    max_pa - min_pa, &answer) != 0 || answer != 0) {
+ 		printf("NEGRONI ADRENO: 21 stop: TrustZone refuses the zap memory (%#llx)\n", answer);
+ 		return false;
+ 	}
+-	announce("write the zap segment into 0x8b91a000 and ask TrustZone to authenticate and run it");
++	announce("write the zap PT_LOAD segments into 0x8b91a000 and ask TrustZone to authenticate and run it");
+ 	mem = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
+ 	for (uint32_t i = 0; i < ZAP_MEMORY_SIZE; i++) {
+-		mem[i] = i < seg_size ? seg[i] : 0;
++		mem[i] = 0;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		char name[24];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		if (ph[0] != 1 || ((ph[6] >> 24) & 7) == 2 || ph[4] == 0) {
++			continue;
++		}
++		snprintf(name, sizeof(name), "a730_zap.b%02u", i);
++		seg = negroni_fw_get(name, &seg_size);
++		if (seg == NULL || seg_size < ph[4] || ph[3] - min_pa + ph[4] > ZAP_MEMORY_SIZE) {
++			printf("NEGRONI ADRENO: 21 stop: segment %u (%s) missing or too large\n", i, name);
++			return false;
++		}
++		for (uint32_t b = 0; b < ph[4]; b++) {
++			mem[ph[3] - min_pa + b] = seg[b];
++		}
++		printf("NEGRONI ADRENO: 21 zap segment %u (%s): %#x bytes at +%#x\n", i, name, ph[4], ph[3] - min_pa);
+ 	}
+ 	__asm__ volatile ("dsb sy");
+ 	answer = ~0ull;

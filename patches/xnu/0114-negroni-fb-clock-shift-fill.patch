@@ -1,0 +1,16 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 68d5505..5c5437a 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -379,9 +379,10 @@ negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_
+ 	}
+ 	for (uint32_t y = 0; y < rows; y++) {
+ 		uint32_t *row = (uint32_t *)(pixels + (uint64_t)y * rowBytes);
++		uint32_t edge = row[0];         /* the status bar's own colour at its left edge */
+ 		memmove(row + n, row, (size_t)(half - n) * 4);
+ 		for (uint32_t x = 0; x < n; x++) {
+-			row[x] = 0;
++			row[x] = edge;
+ 		}
+ 	}
+ }

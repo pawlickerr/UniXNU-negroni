@@ -1,0 +1,147 @@
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 01d1433..be19c79 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -39,6 +39,7 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <libkern/crypto/sha2.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -118,6 +119,7 @@ static struct {
+ 
+ static LCK_GRP_DECLARE(negroni_ufs_grp, "negroni_ufs");
+ static LCK_MTX_DECLARE(negroni_ufs_lock, &negroni_ufs_grp);
++static void negroni_fw_load(void);
+ 
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+@@ -731,6 +733,7 @@ negroni_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	negroni_log_start();
++	negroni_fw_load();
+ 	negroni_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
+ 	negroni_cpufreq_init();
+@@ -808,6 +811,118 @@ negroni_log_position(void)
+ 	return os_atomic_load(&negroni_log_total, relaxed);
+ }
+ 
++
++/*
++ * Firmware area: NEGRONI_FW_SIZE right before the log area, written from a
++ * recovery with dd (negroni-ios/tools/mkfwarea.py builds it; vendor firmware
++ * never goes into git or the boot image). Block 0:
++ *   "NEGRONFW" | u32 version 1 | u32 count | count x { char name[48] |
++ *   u32 offset (bytes from the area start) | u32 size | u8 sha256[32] }
++ * Loaded once into kernel memory after the partition is known; every file's
++ * SHA-256 is checked. negroni_fw_get() hands out a file by name.
++ */
++#define NEGRONI_FW_SIZE           (8u << 20)
++#define NEGRONI_FW_BLOCKS         (NEGRONI_FW_SIZE / UFS_BLOCK)
++#define NEGRONI_FW_MAX            16
++
++struct negroni_fw_entry {
++	char name[48];
++	uint32_t offset, size;
++	uint8_t sha256[32];
++};
++struct negroni_fw_header {
++	char magic[8];
++	uint32_t version, count;
++	struct negroni_fw_entry entry[NEGRONI_FW_MAX];
++};
++
++static uint8_t *negroni_fw_data;
++static struct negroni_fw_header negroni_fw_hdr;
++static uint32_t negroni_fw_ok;          /* bit i: entry i verified */
++
++const void *negroni_fw_get(const char *name, uint32_t *size);
++
++const void *
++negroni_fw_get(const char *name, uint32_t *size)
++{
++	for (uint32_t i = 0; negroni_fw_data && i < negroni_fw_hdr.count; i++) {
++		if ((negroni_fw_ok & (1u << i)) && strncmp(negroni_fw_hdr.entry[i].name, name, 48) == 0) {
++			*size = negroni_fw_hdr.entry[i].size;
++			return negroni_fw_data + negroni_fw_hdr.entry[i].offset;
++		}
++	}
++	return NULL;
++}
++
++static void
++negroni_fw_load(void)
++{
++	uint64_t base = su.first_block + su.nblocks - NEGRONI_LOG_BLOCKS - NEGRONI_FW_BLOCKS;
++	const uint8_t *bounce = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	vm_offset_t buf = 0;
++	uint32_t want;
++	int error;
++
++	if (su.nblocks < 4 * (NEGRONI_LOG_BLOCKS + NEGRONI_FW_BLOCKS)) {
++		return;
++	}
++	lck_mtx_lock(&negroni_ufs_lock);
++	error = ufs_read_blocks(base, 1);
++	if (!error) {
++		memcpy(&negroni_fw_hdr, bounce, sizeof(negroni_fw_hdr));
++	}
++	lck_mtx_unlock(&negroni_ufs_lock);
++	if (error || memcmp(negroni_fw_hdr.magic, "NEGRONFW", 8) != 0 || negroni_fw_hdr.version != 1 ||
++	    negroni_fw_hdr.count == 0 || negroni_fw_hdr.count > NEGRONI_FW_MAX) {
++		printf("NEGRONI FW: no firmware area at block 0x%llx (error %d)\n", base, error);
++		return;
++	}
++	want = 0;
++	for (uint32_t i = 0; i < negroni_fw_hdr.count; i++) {
++		struct negroni_fw_entry *e = &negroni_fw_hdr.entry[i];
++		if (e->offset < UFS_BLOCK || e->offset > NEGRONI_FW_SIZE || e->size > NEGRONI_FW_SIZE - e->offset) {
++			printf("NEGRONI FW: entry %u out of range\n", i);
++			return;
++		}
++		want = MAX(want, e->offset + e->size);
++	}
++	want = (want + UFS_BLOCK - 1) & ~(UFS_BLOCK - 1);
++	if (kmem_alloc(kernel_map, &buf, want, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("NEGRONI FW: no memory for %u bytes\n", want);
++		return;
++	}
++	for (uint32_t at = 0; at < want; at += BOUNCE_SIZE) {
++		uint32_t n = MIN(BOUNCE_SIZE, want - at);
++		lck_mtx_lock(&negroni_ufs_lock);
++		error = ufs_read_blocks(base + at / UFS_BLOCK, n / UFS_BLOCK);
++		if (!error) {
++			memcpy((void *)(buf + at), bounce, n);
++		}
++		lck_mtx_unlock(&negroni_ufs_lock);
++		if (error) {
++			printf("NEGRONI FW: read error %d at +%#x\n", error, at);
++			kmem_free(kernel_map, buf, want);
++			return;
++		}
++	}
++	negroni_fw_data = (uint8_t *)buf;
++	for (uint32_t i = 0; i < negroni_fw_hdr.count; i++) {
++		struct negroni_fw_entry *e = &negroni_fw_hdr.entry[i];
++		uint8_t digest[32];
++		SHA256_CTX ctx;
++
++		e->name[47] = 0;
++		SHA256_Init(&ctx);
++		SHA256_Update(&ctx, negroni_fw_data + e->offset, e->size);
++		SHA256_Final(digest, &ctx);
++		bool ok = memcmp(digest, e->sha256, 32) == 0;
++		if (ok) {
++			negroni_fw_ok |= 1u << i;
++		}
++		printf("NEGRONI FW: %s %u bytes %s\n", e->name, e->size, ok ? "OK" : "SHA-256 MISMATCH");
++	}
++}
++
+ struct negroni_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;

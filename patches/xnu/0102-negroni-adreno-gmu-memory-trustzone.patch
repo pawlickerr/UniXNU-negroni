@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 70a917f..a528e21 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -17,6 +17,10 @@
+  *   7  reads   the GMU's RPMh channel (RSCC, gmu "rscc" 0x3d50000): status, sequencer, TCS0
+  *   8  reads   the adreno SMMU (0x3da0000, MMU-500): ID registers, stream match table, context kinds
+  *   9  reads   SMMU translation context 0 (the GPU's): SCTLR, TTBR0, TCR, FSR
++ *  10  writes  two words into the GMU's data memory (DTCM, CM3 held in reset) and reads them back:
++ *              whether its firmware can be loaded through the register window
++ *  11  asks    TrustZone (SMC, through the hypervisor) calls that pass no memory: is-call-available,
++ *              the PAS image calls, and which images it "supports" (GPU zap = image 13)
+  * negroniadreno_pause=MS waits after each announcement (default 500), so the
+  * persistent log has the line before a silent reset.
+  *
+@@ -79,6 +83,20 @@ void negroni_adreno_init(void);
+ #define GMU_CM3_SYSRESET        0x1f800
+ #define GMU_CM3_FW_INIT_RESULT  0x1f81c
+ #define GMU_RSCC_CONTROL_ACK    0x23b08
++#define GMU_CM3_DTCM_START      0x1c400
++
++/* SCM calls (qcom_scm-smc.c, qcom_scm.c) */
++#define SCM_FAST                (1ull << 31)
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(svc, cmd)      ((uint64_t)(svc) << 8 | (cmd))
++#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_ONE_VALUE           1
++#define SCM_INTERRUPTED         1
++#define PAS_GPU                 13
+ 
+ /* RSCC (a6xx_gmu.xml domain A6XX_RSCC, dword offsets; A730 keeps the pre-A740 layout) */
+ #define RSCC_PHYS               0x03d50000UL
+@@ -460,9 +478,106 @@ step_smmu_context(void)
+ 	return true;
+ }
+ 
++static bool
++step_gmu_memory(void)
++{
++	static const uint32_t pattern[2] = { 0x600d0001, 0x0a110002 };
++	uint32_t was[2], back[2];
++	vm_offset_t dtcm = gmu + GMU_REG(GMU_CM3_DTCM_START);
++
++	if (!cx_ready()) {
++		return false;
++	}
++	if (rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)) == 0xbabeface) {
++		printf("NEGRONI ADRENO: 10 stop: GMU firmware is running, leaving its memory alone\n");
++		return false;
++	}
++	announce("hold the GMU CM3 in reset and write two words into its DTCM (0x3d71000), then read them back");
++	put(gmu, "GMU_CM3_SYSRESET", GMU_REG(GMU_CM3_SYSRESET), 1);
++	for (int i = 0; i < 2; i++) {
++		was[i] = rd(dtcm + 4 * i);
++	}
++	for (int i = 0; i < 2; i++) {
++		wr(dtcm + 4 * i, pattern[i]);
++	}
++	for (int i = 0; i < 2; i++) {
++		back[i] = rd(dtcm + 4 * i);
++		wr(dtcm + 4 * i, was[i]);
++	}
++	bool ok = back[0] == pattern[0] && back[1] == pattern[1];
++	printf("NEGRONI ADRENO: 10 DTCM was %#x %#x, wrote %#x %#x, read %#x %#x: %s\n", was[0], was[1],
++	    pattern[0], pattern[1], back[0], back[1], ok ? "GMU MEMORY TAKES WRITES" : "does not hold what was written");
++	return ok;
++}
++
++/* One SCM call (SMC #0); x6 carries the session for interrupted calls. Returns x0, answer = x1. */
++static int32_t
++scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t session = 0;
++
++	printf("NEGRONI ADRENO: %u SCM %s: smc %#llx (%#llx, %#llx, %#llx)\n", step, what, function, a0, a1, a2);
++	delay(pause_ms * 1000);
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			printf("NEGRONI ADRENO: %u SCM %s -> %d, answer %#llx\n", step, what, (int32_t)x0, x1);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	printf("NEGRONI ADRENO: %u SCM %s keeps returning interrupted\n", step, what);
++	return -1;
++}
++
++static bool
++step_trustzone(void)
++{
++	static const struct { const char *name; uint32_t id; } images[] = {
++		{ "adsp", 1 }, { "modem", 4 }, { "venus", 9 }, { "gpu zap", PAS_GPU },
++	};
++	uint64_t answer = 0, how = SCM_FAST | SCM_64 | SCM_SIP;
++
++	announce("ask TrustZone whether is-call-available is available (Linux's first SCM call)");
++	if (scm("is-call-available", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_IS_CALL_AVAILABLE,
++	    0, 0, &answer) != 0 || answer != 1) {
++		how = SCM_FAST | SCM_SIP;
++		if (scm("is-call-available (32-bit)", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
++		    SCM_SIP | SCM_IS_CALL_AVAILABLE, 0, 0, &answer) != 0 || answer != 1) {
++			printf("NEGRONI ADRENO: 11 stop: TrustZone does not answer as it answers Linux\n");
++			return false;
++		}
++	}
++	scm("has PAS init image", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_PAS_INIT_IMAGE, 0, 0, &answer);
++	scm("has PAS auth and reset", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_PAS_AUTH_AND_RESET,
++	    0, 0, &answer);
++	uint32_t yes = 0;
++	for (unsigned i = 0; i < 4; i++) {
++		answer = 0;
++		if (scm(images[i].name, (how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].id, 0, 0,
++		    &answer) == 0 && answer) {
++			yes |= 1u << i;
++		}
++	}
++	printf("NEGRONI ADRENO: 11 PAS supported: adsp %u modem %u venus %u gpu %u\n", yes & 1, (yes >> 1) & 1,
++	    (yes >> 2) & 1, (yes >> 3) & 1);
++	return true;
++}
++
+ static bool (*const steps[])(void) = {
+ 	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
+-	step_rscc, step_smmu, step_smmu_context,
++	step_rscc, step_smmu, step_smmu_context, step_gmu_memory, step_trustzone,
+ };
+ 
+ void

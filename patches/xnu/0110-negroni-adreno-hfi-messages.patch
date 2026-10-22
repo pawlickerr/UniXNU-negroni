@@ -1,0 +1,256 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 9b43769..ed22e56 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -34,6 +34,8 @@
+  *              FAL veto, TCM retention, HFI table, AHB fence range, CM3 config, chip id 0x07030100,
+  *              log, CX GBIF QoS, cache config; CM3 out of reset; wait for FW_INIT_RESULT
+  *  16  writes  the HFI queue table (command, response, debug) and starts the queues (HFI_CTRL_INIT)
++ *  17  talks   HFI (a6xx_hfi_start): perf table (GX/CX arc votes from cmd-db gfx/mx/cx.lvl and the
++ *              sm8450 GPU/GMU OPP levels), A730 bw table (SH0/MC0/ACV), CORE_FW_START, START
+  * negroniadreno_pause=MS waits after each announcement (default 500), so the
+  * persistent log has the line before a silent reset.
+  *
+@@ -1177,10 +1179,242 @@ step_hfi_start(void)
+ 	return !space_faulted(&gmu_space);
+ }
+ 
++
++/* ---- step 17: HFI messages (Linux a6xx_hfi.c, a6xx_gmu.c rpmh votes) ---- */
++
++#define GMU_HOST2GMU_INTR_SET   0x1f994
++#define GMU_GMU2HOST_INTR_CLR   0x1f991
++#define GMU_GMU2HOST_INTR_INFO  0x1f992
++#define HFI_MSG_PERF_TABLE      4
++#define HFI_MSG_BW_TABLE        3
++#define HFI_MSG_START           10
++#define HFI_MSG_CORE_FW_START   14
++#define HFI_F2H_MSG_ERROR       100
++
++#define CMD_DB_PHYS             0x80860000UL
++#define CMD_DB_SIZE             0x20000u
++#define CMD_DB_HEADER           (4 + 4 + 8 * 16 + 4 + 4)
++
++static vm_offset_t cmd_db;
++static uint32_t hfi_seq;
++
++static uint32_t
++db32(uint32_t off)
++{
++	return off + 4 <= CMD_DB_SIZE ? rd(cmd_db + off) : 0;
++}
++
++/* cmd-db entry: address, and (optionally) its aux data copied out as bytes. */
++static bool
++cmd_db_find(const char *name, uint32_t *address, uint8_t *aux, uint32_t *aux_len)
++{
++	uint32_t key[2] = { 0, 0 };
++
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	for (unsigned sl = 0; sl < 8; sl++) {
++		uint32_t h = 8 + 16 * sl, w0 = db32(h), w1 = db32(h + 4);
++		uint32_t entries = CMD_DB_HEADER + (w0 >> 16), data = CMD_DB_HEADER + (w1 & 0xffff), count = w1 >> 16;
++		if ((w0 & 0xffff) == 0 || count > 1024) {
++			continue;
++		}
++		for (uint32_t j = 0; j < count; j++) {
++			uint32_t e = entries + 24 * j;
++			if (db32(e) != key[0] || db32(e + 4) != key[1]) {
++				continue;
++			}
++			*address = db32(e + 16);
++			if (aux) {
++				uint32_t lo = db32(e + 20), len = lo & 0xffff, off = data + (lo >> 16);
++				len = MIN(len, *aux_len);
++				for (uint32_t b = 0; b < len; b++) {
++					aux[b] = (uint8_t)(db32((off + b) & ~3u) >> (8 * ((off + b) & 3)));
++				}
++				*aux_len = len;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* a6xx_gmu_rpmh_arc_votes_init for one frequency level */
++static uint32_t
++arc_vote(const uint16_t *pri, uint32_t pn, const uint16_t *sec, uint32_t sn, uint32_t level)
++{
++	uint32_t pindex = 0, sindex = 0, j;
++
++	for (j = 0; j < pn; j++) {
++		if (pri[j] >= level) {
++			pindex = j;
++			break;
++		}
++	}
++	if (j == pn) {
++		return 0;
++	}
++	for (j = 0; j < sn; j++) {
++		if (sec[j] >= level) {
++			sindex = j;
++			break;
++		} else if (sec[j]) {
++			sindex = j;
++		}
++	}
++	return ((uint32_t)(pri[pindex] & 0xffff) << 16) | (sindex << 8) | pindex;
++}
++
++/* Write one message into the command queue, ring, and wait for its ack in the response queue. */
++static bool
++hfi_send(const char *what, uint32_t id, uint32_t *msg, uint32_t bytes)
++{
++	struct hfi_queue_header *q = (struct hfi_queue_header *)(gmu_hfi.memory + sizeof(struct hfi_table_header));
++	uint32_t *cmd = (uint32_t *)(gmu_hfi.memory + 4096), *rsp = (uint32_t *)(gmu_hfi.memory + 8192);
++	uint32_t dwords = bytes >> 2, seq = (++hfi_seq) % 0xfff, index;
++
++	msg[0] = seq << 20 | 0u << 16 | dwords << 8 | id;
++	to_memory((vm_offset_t)q, 3 * sizeof(*q));
++	index = q[0].write_index;
++	for (uint32_t i = 0; i < dwords; i++) {
++		cmd[index] = msg[i];
++		index = (index + 1) % q[0].size;
++	}
++	for (; index % 4; index = (index + 1) % q[0].size) {
++		cmd[index] = 0xfafafafa;
++	}
++	to_memory((vm_offset_t)cmd, 4096);
++	q[0].write_index = index;
++	to_memory((vm_offset_t)q, 3 * sizeof(*q));
++	printf("NEGRONI ADRENO: 17 HFI send %s (id %u, %u dwords, seq %u)\n", what, id, dwords, seq);
++	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1);
++	for (int tries = 0; tries < 3; tries++) {
++		if (!wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1, 1, 1000)) {
++			printf("NEGRONI ADRENO: 17 stop: no HFI response to %s (INTR_INFO %#x)\n", what,
++			    rd(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO)));
++			return false;
++		}
++		wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1);
++		to_memory((vm_offset_t)q, 3 * sizeof(*q));
++		to_memory((vm_offset_t)rsp, 4096);
++		while (q[1].read_index != q[1].write_index) {
++			uint32_t r = q[1].read_index, hdr = rsp[r], n = (hdr >> 8) & 0xff, words[8] = { 0 };
++			for (uint32_t i = 0; i < n; i++) {
++				if (i < 8) {
++					words[i] = rsp[r];
++				}
++				r = (r + 1) % q[1].size;
++			}
++			r = ((r + 3) & ~3u) % q[1].size;
++			q[1].read_index = r;
++			to_memory((vm_offset_t)q, 3 * sizeof(*q));
++			if ((hdr & 0xff) == HFI_F2H_MSG_ERROR) {
++				printf("NEGRONI ADRENO: 17 GMU firmware error %u\n", words[1]);
++				continue;
++			}
++			if (((words[1] >> 20) & 0xfff) != seq) {
++				continue;
++			}
++			printf("NEGRONI ADRENO: 17 HFI %s ack, error %u\n", what, words[2]);
++			return words[2] == 0;
++		}
++	}
++	printf("NEGRONI ADRENO: 17 stop: no ack for %s\n", what);
++	return false;
++}
++
++/* sm8450.dtsi gpu_opp_table (ascending) and the GMU's OPPs; RPMh corner levels */
++static const uint32_t gpu_khz[] = { 0, 220000, 285000, 317000, 350000, 421000, 492000, 545000, 599000, 640000,
++	                            734000, 791000, 818000 };
++static const uint16_t gpu_level[] = { 0, 56, 56, 64, 64, 80, 128, 144, 192, 224, 256, 320, 384 };
++static const uint32_t gmu_khz[] = { 0, 200000, 500000 };
++static const uint16_t gmu_level[] = { 0, 64, 128 };
++
++static bool
++step_hfi_messages(void)
++{
++	static uint16_t gfx[16], mx[16], cx[16];
++	uint32_t gfx_n = sizeof(gfx), mx_n = sizeof(mx), cx_n = sizeof(cx), a;
++	static uint32_t perf[3 + 16 * 3 + 4 * 2], bw[6 + 6 + 12 + 8 + 16 * 8];
++
++	if (!gmu_started) {
++		printf("NEGRONI ADRENO: 17 stop: the GMU does not run\n");
++		return false;
++	}
++	cmd_db = ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
++	if (!cmd_db || db32(4) != 0x0c0330db ||
++	    !cmd_db_find("gfx.lvl", &a, (uint8_t *)gfx, &gfx_n) || !cmd_db_find("mx.lvl", &a, (uint8_t *)mx, &mx_n) ||
++	    !cmd_db_find("cx.lvl", &a, (uint8_t *)cx, &cx_n)) {
++		printf("NEGRONI ADRENO: 17 stop: cmd-db arc levels not found\n");
++		return false;
++	}
++	gfx_n /= 2;
++	mx_n /= 2;
++	cx_n /= 2;
++	printf("NEGRONI ADRENO: 17 arc levels: gfx %u, mx %u, cx %u (gfx top %u)\n", gfx_n, mx_n, cx_n,
++	    gfx_n ? gfx[gfx_n - 1] : 0);
++
++	/* perf table: header, num_gpu_levels, num_gmu_levels, gx {vote, acd, freq} x16, cx {vote, freq} x4 */
++	memset(perf, 0, sizeof(perf));
++	uint32_t ng = sizeof(gpu_khz) / sizeof(gpu_khz[0]), nc = sizeof(gmu_khz) / sizeof(gmu_khz[0]);
++	perf[1] = ng;
++	perf[2] = nc;
++	for (uint32_t i = 0; i < ng; i++) {
++		perf[3 + 3 * i] = arc_vote(gfx, gfx_n, mx, mx_n, gpu_level[i]);
++		perf[3 + 3 * i + 1] = 0xffffffff;
++		perf[3 + 3 * i + 2] = gpu_khz[i] / 1000;
++	}
++	for (uint32_t i = 0; i < nc; i++) {
++		perf[3 + 48 + 2 * i] = arc_vote(cx, cx_n, mx, mx_n, gmu_level[i]);
++		perf[3 + 48 + 2 * i + 1] = gmu_khz[i] / 1000;
++	}
++	printf("NEGRONI ADRENO: 17 GX vote top %#x, CX vote 200 MHz %#x\n", perf[3 + 3 * (ng - 1)], perf[3 + 48 + 2]);
++	if (!hfi_send("PERF_TABLE", HFI_MSG_PERF_TABLE, perf, sizeof(perf))) {
++		return false;
++	}
++
++	/* a730_build_bw_table */
++	static const uint32_t ddr[12][3] = {
++		{ 0x40000000, 0x40000000, 0x40000000 }, { 0x600002e8, 0x600003d0, 0x60000008 },
++		{ 0x6000068d, 0x6000089a, 0x60000008 }, { 0x600007f2, 0x60000a6e, 0x60000008 },
++		{ 0x600009e5, 0x60000cfd, 0x60000008 }, { 0x60000b29, 0x60000ea6, 0x60000008 },
++		{ 0x60001698, 0x60001da8, 0x60000008 }, { 0x600018d2, 0x60002093, 0x60000008 },
++		{ 0x60001e66, 0x600027e6, 0x60000008 }, { 0x600027c2, 0x6000342f, 0x60000008 },
++		{ 0x60002e71, 0x60003cf5, 0x60000008 }, { 0x600030ae, 0x60003fe5, 0x60000008 },
++	};
++	memset(bw, 0, sizeof(bw));
++	bw[1] = 12;                     /* bw_level_num */
++	bw[3] = 3;                      /* ddr_cmds_num */
++	bw[5] = 0x7;                    /* ddr_wait_bitmask */
++	uint32_t *ddr_addrs = &bw[6 + 6 + 12], *ddr_data = &bw[6 + 6 + 12 + 8];
++	if (!cmd_db_find("SH0", &ddr_addrs[0], NULL, NULL) || !cmd_db_find("MC0", &ddr_addrs[1], NULL, NULL) ||
++	    !cmd_db_find("ACV", &ddr_addrs[2], NULL, NULL)) {
++		printf("NEGRONI ADRENO: 17 stop: SH0/MC0/ACV not in cmd-db\n");
++		return false;
++	}
++	for (int i = 0; i < 12; i++) {
++		for (int j = 0; j < 3; j++) {
++			ddr_data[8 * i + j] = ddr[i][j];
++		}
++	}
++	printf("NEGRONI ADRENO: 17 BCM SH0 %#x MC0 %#x ACV %#x\n", ddr_addrs[0], ddr_addrs[1], ddr_addrs[2]);
++	if (!hfi_send("BW_TABLE", HFI_MSG_BW_TABLE, bw, sizeof(bw))) {
++		return false;
++	}
++	uint32_t one[1];
++	if (!hfi_send("CORE_FW_START", HFI_MSG_CORE_FW_START, one, sizeof(one)) ||
++	    !hfi_send("START", HFI_MSG_START, one, sizeof(one))) {
++		return false;
++	}
++	printf("NEGRONI ADRENO: 17 GMU TAKES ITS TABLES AND IS STARTED\n");
++	return !space_faulted(&gmu_space);
++}
++
+ static bool (*const steps[])(void) = {
+ 	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
+ 	step_rscc, step_smmu, step_smmu_context, step_gmu_memory, step_trustzone,
+ 	step_zap_signature, step_gmu_space, step_gmu_firmware, step_gmu_start, step_hfi_start,
++	step_hfi_messages,
+ };
+ 
+ void

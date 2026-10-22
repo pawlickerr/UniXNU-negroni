@@ -1,0 +1,223 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index d1c48fd..9b43769 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -29,6 +29,11 @@
+  *              stream-match entry, picked from what step 8 reads; negroniadreno_cb / _smr force)
+  *  14  writes  gmu_gen70000.bin: ITCM/DTCM blocks through the register window (CM3 in reset),
+  *              the rest into the icache memory (a6xx_gmu_fw_load)
++ *  15  writes  RSC/PDC handshake + RSC sequencer (a6xx_gmu_rpmh_init; A730: pre-A740 offsets, TCS
++ *              data 0x80000000, PDC sequence in AOP so only PDC enable), then a6xx_gmu_fw_start:
++ *              FAL veto, TCM retention, HFI table, AHB fence range, CM3 config, chip id 0x07030100,
++ *              log, CX GBIF QoS, cache config; CM3 out of reset; wait for FW_INIT_RESULT
++ *  16  writes  the HFI queue table (command, response, debug) and starts the queues (HFI_CTRL_INIT)
+  * negroniadreno_pause=MS waits after each announcement (default 500), so the
+  * persistent log has the line before a silent reset.
+  *
+@@ -990,10 +995,192 @@ step_gmu_firmware(void)
+ 	return loaded > 0;
+ }
+ 
++
++/* ---- steps 15, 16: start the GMU (Linux a6xx_gmu_rpmh_init, a6xx_gmu_fw_start, a6xx_hfi_init) ---- */
++
++#define GMU_PDC_PHYS            0x0b290000UL
++#define GMU_PDC_SIZE            0x10000UL
++#define PDC_GPU_ENABLE_PDC      (4 * 0x1140)
++#define PDC_GPU_SEQ_START_ADDR  (4 * 0x1148)
++#define CX_MISC_PHYS            0x03d9e000UL
++#define CX_MISC_TCM_RET_CNTL    (4 * 0x39)
++
++#define RSCC_STATUS0            (4 * 0x004)
++#define RSCC_PDC_SEQ_START      (4 * 0x008)
++#define RSCC_PDC_MATCH_LO       (4 * 0x009)
++#define RSCC_PDC_MATCH_HI       (4 * 0x00a)
++#define RSCC_PDC_SLAVE_ID       (4 * 0x00b)
++#define RSCC_HIDDEN_TCS_ADDR    (4 * 0x00d)
++#define RSCC_HIDDEN_TCS_DATA    (4 * 0x00e)
++#define RSCC_OVERRIDE_START     (4 * 0x100)
++#define RSCC_SEQ_MEM_0          (4 * 0x180)
++
++#define GMU_FALNEXT_INTF        0x1f8f1
++#define GMU_FAL_INTF            0x1f8f0
++#define GMU_CM3_BOOT_CONFIG     0x1f801
++#define GMU_CM3_CFG             0x1f82d
++#define GMU_HFI_QTBL_INFO       0x1f984
++#define GMU_HFI_QTBL_ADDR       0x1f985
++#define GMU_HFI_CTRL_INIT       0x1f986
++#define GMU_HFI_CTRL_STATUS     0x1f980
++#define GMU_AHB_FENCE_RANGE_0   0x23b11
++#define GMU_AO_AHB_FENCE_CTRL   0x23b10
++#define GMU_GENERAL_8           0x1f9cd
++#define GMU_GENERAL_9           0x1f9ce
++#define GMU_GENERAL_10          0x1f9cf
++#define GMU_ICACHE_CONFIG       0x1f400
++#define GMU_DCACHE_CONFIG       0x1f401
++#define GMU_SYS_BUS_CONFIG      0x1f40f
++#define GMU_CORE_FW_VERSION     0x1d3f8
++#define GPU_GBIF_QSB_SIDE0      0x3c03          /* dword, GPU space */
++#define A730_GMU_CHIPID         0x07030100u     /* chip_id 0x07030001 in the GMU's packing */
++
++static vm_offset_t gpu_regs, cx_misc, gmu_pdc;
++static bool gmu_started;
++
++static void
++gmu_put(const char *name, uint32_t dw, uint32_t value)
++{
++	put(gmu, name, GMU_REG(dw), value);
++}
++
++struct hfi_table_header {
++	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
++};
++struct hfi_queue_header {
++	uint32_t status, iova, type, size, msg_size, dropped, rx_watermark, tx_watermark,
++	    rx_request, tx_request, read_index, write_index;
++};
++
++static void
++hfi_table_init(void)
++{
++	struct hfi_table_header *table = (struct hfi_table_header *)gmu_hfi.memory;
++	struct hfi_queue_header *q = (struct hfi_queue_header *)(gmu_hfi.memory + sizeof(*table));
++
++	/* a6xx_hfi_init: table header, then command (0), response (1), debug (2) queues at +4K/+8K/+12K */
++	table->version = 0;
++	table->size = sizeof(*table) + 3 * sizeof(*q);
++	table->qhdr0_offset = sizeof(*table) >> 2;
++	table->qhdr_size = sizeof(*q) >> 2;
++	table->num_queues = 3;
++	table->active_queues = 3;
++	for (uint32_t i = 0; i < 3; i++) {
++		memset(&q[i], 0, sizeof(q[i]));
++		q[i].iova = (uint32_t)gmu_hfi.address + 4096 * (i + 1);
++		q[i].type = 10u << 8 | i;
++		q[i].status = 1;
++		q[i].size = 4096 >> 2;
++		q[i].rx_watermark = 1;
++		q[i].tx_watermark = 1;
++		q[i].rx_request = 1;
++		q[i].tx_request = 0;
++	}
++	to_memory(gmu_hfi.memory, gmu_hfi.size);
++}
++
++static bool
++step_gmu_start(void)
++{
++	uint32_t ver, mask, want;
++
++	if (!cx_ready() || !gmu_space_on) {
++		printf("NEGRONI ADRENO: 15 stop: needs steps 13-14\n");
++		return false;
++	}
++	gpu_regs = ml_io_map(GPU_PHYS, 0x40000);
++	cx_misc = ml_io_map(CX_MISC_PHYS, 0x1000);
++	gmu_pdc = ml_io_map(GMU_PDC_PHYS, GMU_PDC_SIZE);
++
++	announce("set up the GPU RSC/PDC handshake and the RSC sequencer (a6xx_gmu_rpmh_init)");
++	put(rscc, "RSC_STATUS0 (SDE clock gating off)", RSCC_STATUS0, 1u << 24);
++	put(rscc, "PDC_SLAVE_ID", RSCC_PDC_SLAVE_ID, 1);
++	put(rscc, "HIDDEN_TCS_DATA0", RSCC_HIDDEN_TCS_DATA, 0);
++	put(rscc, "HIDDEN_TCS_ADDR0", RSCC_HIDDEN_TCS_ADDR, 0);
++	put(rscc, "HIDDEN_TCS_DATA1", RSCC_HIDDEN_TCS_DATA + 8, 0);
++	put(rscc, "HIDDEN_TCS_ADDR1", RSCC_HIDDEN_TCS_ADDR + 8, 0);
++	put(rscc, "HIDDEN_TCS_DATA2", RSCC_HIDDEN_TCS_DATA + 16, 0x80000000);
++	put(rscc, "HIDDEN_TCS_ADDR2", RSCC_HIDDEN_TCS_ADDR + 16, 0);
++	put(rscc, "OVERRIDE_START", RSCC_OVERRIDE_START, 0);
++	put(rscc, "PDC_SEQ_START", RSCC_PDC_SEQ_START, 0x4520);
++	put(rscc, "PDC_MATCH_LO", RSCC_PDC_MATCH_LO, 0x4510);
++	put(rscc, "PDC_MATCH_HI", RSCC_PDC_MATCH_HI, 0x4514);
++	static const uint32_t seq[5] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
++	for (int i = 0; i < 5; i++) {
++		put(rscc, "SEQ_MEM", RSCC_SEQ_MEM_0 + 4 * i, seq[i]);
++	}
++	put(gmu_pdc, "PDC_GPU_SEQ_START_ADDR", PDC_GPU_SEQ_START_ADDR, 0);
++	put(gmu_pdc, "PDC_GPU_ENABLE_PDC", PDC_GPU_ENABLE_PDC, 0x80000001);
++
++	announce("configure the GMU for its start (a6xx_gmu_fw_start)");
++	gmu_put("FALNEXT_INTF", GMU_FALNEXT_INTF, 1);
++	gmu_put("FAL_INTF", GMU_FAL_INTF, 1);
++	put(cx_misc, "CX_MISC_TCM_RET_CNTL", CX_MISC_TCM_RET_CNTL, 1);
++	gmu_put("CM3_FW_INIT_RESULT", GMU_CM3_FW_INIT_RESULT, 0);
++	gmu_put("CM3_BOOT_CONFIG", GMU_CM3_BOOT_CONFIG, 2);
++	gmu_put("HFI_QTBL_ADDR", GMU_HFI_QTBL_ADDR, (uint32_t)gmu_hfi.address);
++	gmu_put("HFI_QTBL_INFO", GMU_HFI_QTBL_INFO, 1);
++	gmu_put("AHB_FENCE_RANGE_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | 0x32u << 18 | 0x8a0u);
++	gmu_put("CM3_CFG", GMU_CM3_CFG, 0x4052);
++	gmu_put("GENERAL_10 (chip id)", GMU_GENERAL_10, A730_GMU_CHIPID);
++	gmu_put("GENERAL_8 (log)", GMU_GENERAL_8, ((uint32_t)gmu_log.address & 0xfffff000u) | ((gmu_log.size / 4096 - 1) & 0xff));
++	for (int i = 0; i < 4; i++) {
++		put(gpu_regs, "GBIF_QSB_SIDE", 4 * (GPU_GBIF_QSB_SIDE0 + i), 0x00071620);
++	}
++	gmu_put("SYS_BUS_CONFIG", GMU_SYS_BUS_CONFIG, 1);
++	gmu_put("ICACHE_CONFIG", GMU_ICACHE_CONFIG, 1);
++	gmu_put("DCACHE_CONFIG", GMU_DCACHE_CONFIG, 1);
++
++	/* a6xx_gmu_start */
++	ver = rd(gmu + GMU_REG(GMU_CM3_DTCM_START) + 4 * 0xff8);
++	if (ver <= 0x20010004) {
++		mask = 0xffffffff;
++		want = 0xbabeface;
++	} else {
++		mask = 0x1ff;
++		want = 0x100;
++	}
++	printf("NEGRONI ADRENO: 15 firmware version word %#x: waiting for init result %#x (mask %#x)\n", ver, want, mask);
++	hfi_table_init();
++	announce("release the GMU CM3 from reset: its firmware starts");
++	gmu_put("CM3_SYSRESET", GMU_CM3_SYSRESET, 1);
++	gmu_put("GENERAL_9 (log wptr)", GMU_GENERAL_9, 0);
++	gmu_put("CM3_SYSRESET", GMU_CM3_SYSRESET, 0);
++	if (!wait_for(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT), mask, want, 100)) {
++		printf("NEGRONI ADRENO: 15 stop: GMU firmware did not report init (FW_INIT_RESULT %#x)\n",
++		    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)));
++		space_faulted(&gmu_space);
++		return false;
++	}
++	gmu_started = true;
++	printf("NEGRONI ADRENO: 15 GMU FIRMWARE RUNS: FW_INIT_RESULT %#x, CORE_FW_VERSION %#x\n",
++	    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)), rd(gmu + GMU_REG(GMU_CORE_FW_VERSION)));
++	return !space_faulted(&gmu_space);
++}
++
++static bool
++step_hfi_start(void)
++{
++	if (!gmu_started) {
++		printf("NEGRONI ADRENO: 16 stop: the GMU does not run (step 15)\n");
++		return false;
++	}
++	announce("start the HFI queues");
++	gmu_put("HFI_CTRL_INIT", GMU_HFI_CTRL_INIT, 1);
++	if (!wait_for(gmu + GMU_REG(GMU_HFI_CTRL_STATUS), 1, 1, 100)) {
++		printf("NEGRONI ADRENO: 16 stop: HFI queues do not start (status %#x)\n",
++		    rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS)));
++		return false;
++	}
++	gmu_put("AO_AHB_FENCE_CTRL (allow)", GMU_AO_AHB_FENCE_CTRL, 0);
++	printf("NEGRONI ADRENO: 16 HFI QUEUES STARTED (status %#x)\n", rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS)));
++	return !space_faulted(&gmu_space);
++}
++
+ static bool (*const steps[])(void) = {
+ 	step_gcc, step_gpucc_read, step_gmu_read_if_on, step_cx_power, step_clocks, step_gmu_first_words,
+ 	step_rscc, step_smmu, step_smmu_context, step_gmu_memory, step_trustzone,
+-	step_zap_signature, step_gmu_space, step_gmu_firmware,
++	step_zap_signature, step_gmu_space, step_gmu_firmware, step_gmu_start, step_hfi_start,
+ };
+ 
+ void
+diff --git a/bsd/dev/negroni_keys.c b/bsd/dev/negroni_keys.c
+index 627f244..74251af 100644
+--- a/bsd/dev/negroni_keys.c
++++ b/bsd/dev/negroni_keys.c
+@@ -109,7 +109,7 @@ keys_open(void)
+ uint32_t negroni_probe_gpu = ~0u, negroni_probe_wifi = ~0u;
+ void negroni_probe_menu(void);
+ 
+-#define PROBE_GPU_MAX   14
++#define PROBE_GPU_MAX   22
+ #define PROBE_WIFI_MAX  4
+ 
+ static uint8_t

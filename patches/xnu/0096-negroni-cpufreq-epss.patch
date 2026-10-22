@@ -1,0 +1,130 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 60f1f47..57fbc06 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/negroni_ufs.c			standard
+ bsd/dev/negroni_sample.c			standard
+ bsd/dev/negroni_keys.c			standard
+ bsd/dev/negroni_touch.c			standard
++bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+diff --git a/bsd/dev/negroni_cpufreq.c b/bsd/dev/negroni_cpufreq.c
+new file mode 100644
+index 0000000..ec07107
+--- /dev/null
++++ b/bsd/dev/negroni_cpufreq.c
+@@ -0,0 +1,92 @@
++/*
++ * NEGRONI (SM8450) CPU clock speed. ABL leaves each cluster at a modest
++ * frequency and expects the OS to ask for more; on this SoC that is one
++ * register write per frequency domain: the EPSS has a table of rows and
++ * switches clock source and voltage itself when told which row is wanted.
++ * The hardware limits management (LMh) still throttles on its own when the
++ * die gets hot. Layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c (epss),
++ * addresses: sm8450.dtsi cpufreq@17d91000. Ported for negroni from the
++ * Linux qcom-cpufreq-hw EPSS layout.
++ *
++ * Boot args: negronicpufreq=0 leaves the clocks alone; negronicpufreq_mhz=N
++ * caps each domain at the highest row not above N MHz (default 2400).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void negroni_cpufreq_init(void);
++
++#define EPSS_PHYS               0x17d91000UL    /* domain 0: A510 0-3, 1: A710 4-6, 2: X2 7 */
++#define EPSS_DOMAIN_SIZE        0x1000UL
++#define EPSS_DOMAINS            3
++#define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] source, [7:0] multiple of 19.2 MHz */
++#define EPSS_TABLE_ROWS         40
++#define EPSS_PERF_STATE         0x320           /* the wanted row */
++#define XO_KHZ                  19200
++#define ALTERNATE_KHZ           300000          /* source 0: GPLL0 300 MHz */
++
++static uint32_t
++domain_of(uint32_t phys_id)
++{
++	uint32_t core = (phys_id & 0xff00) ? (phys_id >> 8) & 0xff : phys_id & 0xff;
++
++	return core < 4 ? 0 : core < 7 ? 1 : 2;
++}
++
++static void
++raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
++{
++	uint32_t top = 0, top_khz = 0, was;
++	vm_offset_t base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
++
++	if (!base) {
++		printf("NEGRONI CPUFREQ: domain %u not mapped\n", domain);
++		return;
++	}
++	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
++		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
++		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
++
++		if (row > 0 && khz <= top_khz) {
++			break;          /* the table ends by repeating its last row */
++		}
++		if (khz > cap_khz) {
++			break;
++		}
++		top = row;
++		top_khz = khz;
++	}
++	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
++	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
++	delay(20000);
++	printf("NEGRONI CPUFREQ: domain %u (%u cores): row %u -> %u, %u MHz\n",
++	    domain, cores, was, top, top_khz / 1000);
++}
++
++void
++negroni_cpufreq_init(void)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint32_t enabled = 1, cap_mhz = 2400, cores[EPSS_DOMAINS] = { 0 };
++
++	(void)PE_parse_boot_argn("negronicpufreq", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("negronicpufreq_mhz", &cap_mhz, sizeof(cap_mhz));
++	if (!enabled) {
++		printf("NEGRONI CPUFREQ: disabled (negronicpufreq=0)\n");
++		return;
++	}
++	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++		cores[domain_of(topology->cpus[i].phys_id)]++;
++	}
++	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
++		if (cores[domain] != 0) {
++			raise_domain(domain, cores[domain], cap_mhz * 1000);
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 8aff029..133b69f 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -52,6 +52,7 @@ static void negroni_log_start(void);
+ extern void negroni_sample_start(void);
+ extern void negroni_keys_init(void);
+ extern void negroni_touch_init(void);
++extern void negroni_cpufreq_init(void);
+ extern void negroni_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -731,6 +732,7 @@ negroni_ufs_init(void)
+ 	negroni_log_start();
+ 	negroni_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
++	negroni_cpufreq_init();
+ 	negroni_keys_init();
+ 	negroni_touch_init();
+ 	negroni_usb_probe();
