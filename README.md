@@ -4,6 +4,11 @@ Bring-up repository for running the `ios-sweet` XNU kernel (xnu-8796, the iOS 16
 of the sweet port, built for negroni) and the iPhone X iOS 16.7.16 userland on a
 OnePlus 10 Pro 5G (negroni, SM8450) through Mu-Silicium UEFI and UniXNU/DarwinBoot.
 
+The phone boots into the iOS userland (SpringBoard) without GPU acceleration: everything is
+drawn on the CPU.
+
+UEFI: [Mu-Silicium for negroni](https://github.com/pawlickerr/Mu-Silicium-negroni).
+
 `ios-sweet` remains the kernel/rootfs source. This repository owns the board file, the
 `NEGRONIESP` payload and the Android boot image.
 
@@ -87,3 +92,10 @@ The kernel and the ADT come from `ios-sweet`:
 The iOS root stays on the phone. The Apple D22AP base ADT, vendor firmware, kernels
 and images are kept out of git. The platform seed (`UNIQUE_CHIP_ID`) and
 `ARTIFACT_KEY` live in CI secrets and `~/ios-work/unixnu-secrets`.
+
+## Credits
+
+- [UniXNU](https://github.com/UniXNU/UniXNU) and DarwinBoot: the UEFI loader that boots XNU
+- ios-sweet: the XNU kernel port and the iOS 16 userland this repository boots
+- [Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium): the UEFI firmware the negroni
+  port is built on
