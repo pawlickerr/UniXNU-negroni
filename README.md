@@ -1,36 +1,55 @@
-# unixnu — negroni device repository
+# UniXNU-negroni
 
-Bring-up of the `ios-sweet` XNU (xnu-8796 with the negroni patches) and the iPhone X iOS 16.7
-userland on a **OnePlus 10 Pro 5G (negroni, SM8450)** through Mu-Silicium UEFI and
-UniXNU/DarwinBoot: one board file, small scripts, nothing large in git.
+Bring-up repository for running the `ios-sweet` XNU kernel (xnu-8796, the iOS 16 kernel
+of the sweet port, built for negroni) and the iPhone X iOS 16.7.16 userland on a
+OnePlus 10 Pro 5G (negroni, SM8450) through Mu-Silicium UEFI and UniXNU/DarwinBoot.
 
-`ios-sweet` stays the kernel/rootfs source (`negroni-ios/`), this directory owns the boot payload,
-the boot image and the way they get onto the phone.
+`ios-sweet` remains the kernel/rootfs source. This repository owns the board file, the
+`NEGRONIESP` payload and the Android boot image.
 
-## Status (2026-10-22)
+## Status
 
-- Boots to SpringBoard on 8 cores with touch, keys, UFS root (read-write), persistent log.
-- Wi-Fi (QCA6490 on PCIe0): read-only survey only.
-- Sileo + Procursus installed in the root.
+Hardware-verified on an NE2213:
 
-Details and history: `../NOTES.md`.
+- The ios-sweet shim starts Mu-Silicium (DEBUG); its UniXNU menu lists
+  **"iOS 16 (negroni-ios XNU)"**.
+- UniXNU mounts the 64 MiB `NEGRONIESP` FAT32 payload, reads
+  `\EFI\UniXNU\unixnu.toml` and hands `Payloads\kernel.macho` plus the ADT to DarwinBoot.
+- DarwinBoot validates the inputs and enters the iOS 16 XNU kernel in the Mu
+  "Kernel RAM" window (ADT DRAM 0x840000000, 3 GiB).
+- XNU mounts the iOS 16.7.16 root from userdata (UFS, read-write) and reaches
+  SpringBoard on 8 cores, with touch, the hardware keys and a persistent console log.
+- Sileo and the Procursus bootstrap are installed in the root.
+
+Wi-Fi (QCA6490 on PCIe0) is not brought up yet.
 
 ## Layout
 
 ```
-board.toml          the board: kernel args, payload, boot image, storage layout
+board.toml          board file: kernel args, payload, boot image
 scripts/
-  board.py          shared helpers (board file, paths, fastboot/adb)
-  fetch-kernel.py   download a negroni-ios CI kernel into inputs/
-  build-adt.py      inputs/negroni.adt with mkadt
-  build-payload.py  out/esp.img (UniXNU config + DarwinBoot inputs) from board.toml
-  build-bootimg.py  out/boot_a.img (Mu-Silicium + shim + payload)
+  board.py          shared helpers (board file, paths, fastboot)
+  fetch-kernel.py   download an ios-sweet negroni kernel from CI into inputs/
+  build-adt.py      inputs/negroni.adt
+  build-payload.py  out/esp.img: NEGRONIESP payload (UniXNU config + DarwinBoot inputs)
+  build-bootimg.py  out/boot_a.img: Mu-Silicium + ios-sweet shim + payload
   flash.py          flash out/boot_a.img with fastboot
-patches/            where changes to external trees live
-inputs/  out/       kernels, ADT, images, logs (ignored)
+patches/            changes to external trees
+inputs/             kernel Mach-O, ADT (ignored)
+out/                build products (ignored)
 ```
 
-## Usual cycle
+## External trees
+
+The build needs these next to this repository (paths in `board.toml`):
+
+- `ios-sweet` (this repository's parent): the kernel is built there by the
+  `negroni-ios` workflow from `xnu-8796.141.3` plus `negroni-ios/xnu/patches/`;
+  `negroni-ios/tools/` holds `mkadt.py` and `mkdarwinboot.py`.
+- `~/ios-work/Mu-Silicium`: Mu-Silicium with the negroni platform
+  (`uefi/negroni/negroniPkg` in ios-sweet), built DEBUG by `uefi/negroni/shim-mu.sh`.
+
+## Build
 
 ```sh
 cd unixnu
@@ -46,7 +65,13 @@ A one-off boot arg without editing the board file:
 scripts/build-payload.py --drop negronifb_clockshift= --arg negronifb_clockshift=80
 ```
 
-## Inputs that stay out of git
+## Build inputs
 
-Vendor firmware, the Apple D22AP base ADT, kernels, images, logs. The platform seed (`UNIQUE_CHIP_ID`) and `ARTIFACT_KEY` live in CI secrets and
-`~/ios-work/unixnu-secrets`.
+The kernel and the ADT come from `ios-sweet`:
+
+- the `negroni-ios-kernel` CI artifact (`kernel.development.negroni`) -> `inputs/kernel.macho`
+- `negroni-ios/tools/mkadt.py` -> `inputs/negroni.adt`
+
+The iOS root stays on the phone. The Apple D22AP base ADT, vendor firmware, kernels
+and images are kept out of git. The platform seed (`UNIQUE_CHIP_ID`) and
+`ARTIFACT_KEY` live in CI secrets and `~/ios-work/unixnu-secrets`.
