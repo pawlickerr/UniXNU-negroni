@@ -7,7 +7,7 @@ OnePlus 10 Pro 5G (negroni, SM8450) through Mu-Silicium UEFI and UniXNU/DarwinBo
 The phone boots into the iOS userland (SpringBoard) without GPU acceleration: everything is
 drawn on the CPU.
 
-UEFI: [Mu-Silicium for negroni](https://github.com/pawlickerr/Mu-Silicium-negroni).
+UEFI: [Mu-Silicium for negroni](https://github.com/pawlickerr/Mu-Silicum-negroni).
 
 `ios-sweet` remains the kernel/rootfs source. This repository owns the board file, the
 `NEGRONIESP` payload and the Android boot image.
