@@ -1,0 +1,9 @@
+/inputs/
+/out/
+/.cache/
+*.img
+*.fd
+*.efi
+*.bin
+*.adt
+__pycache__/

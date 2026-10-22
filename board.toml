@@ -1,0 +1,73 @@
+# OnePlus 10 Pro 5G (negroni, SM8450) device repository for UniXNU / DarwinBoot.
+# The kernel (xnu-8796 + negroni-ios/xnu/patches) is built by .github/workflows/negroni-ios.yml;
+# this board file drives the payload (ESP), the boot image and the flashing.
+
+[board]
+name = "negroni"
+soc = "SM8450"
+description = "OnePlus 10 Pro 5G (NE2213)"
+
+[firmware]
+# Mu-Silicium DEBUG with negroniPkg; the ios-sweet shim wraps the FD (uefi/negroni/shim-mu.sh).
+tree = "~/ios-work/Mu-Silicium"
+target = "DEBUG"
+shim = "uefi/negroni/shim-mu.sh"
+
+[kernel]
+workflow = "negroni-ios"
+artifact = "negroni-ios-kernel"
+repo = "MellysInformejtik/slop"
+macho = "kernel.development.negroni"
+
+[payload]
+volume = "NEGRONIESP"
+size_mib = 64
+tool = "negroni-ios/tools/mkdarwinboot.py"
+timeout = 3
+kernel_args = [
+  "debug=0xc",
+  "serial=3",
+  "cpus=8",
+  "keepsyms=1",
+  "-noprogress",
+  "rd=ufsroot0",
+  "ufsrw=1",
+  "rootrw=1",
+  "unentitled_ios_sim_launch=1",
+  "ignition_level=1",
+  "wdt_test=no_user_checkin",
+  "launchd_unsecure_cache=1",
+  "wdt=-1",
+  "negronikeys=1",
+  "negronitouch=1",
+  "negroniusb=0",
+  "negronisample=-",
+  "negronifb_noconsole=1",
+  "negronifb_clockshift=100",
+  "negroniwifi=4",
+]
+
+[payload.adt]
+tool = "negroni-ios/tools/mkadt.py"
+args = ["--board", "negroni", "--ufs", "--dram", "840000000:C0000000", "--darwinboot"]
+# The platform seed (unique_chip_id) is never committed; mkadt reads it from the environment
+# (UNIQUE_CHIP_ID) when one is needed.
+
+[bootimg]
+header_version = 4
+pagesize = 4096
+vendor_boot = "shim/out/negroni-a/vendor_boot.img"
+vbmeta_backup = "dtb/negroni/backup/vbmeta_a.img"
+vbmeta_flags = 3                    # disable verity and verification
+stock_backup = "dtb/negroni/backup" # boot_a, vendor_boot_a, dtbo_a, vbmeta_a for OrangeFox
+
+[storage]
+# userdata is sda14 (LUN 0); the iOS root (HFS+, 16 GiB) starts at its first block.
+userdata = "/dev/block/sda14"
+userdata_blocks = 27432207          # 4 KiB blocks (sysfs size / 8; OrangeFox blockdev is wrong)
+log_lun_block = 0x1cde3fa           # persistent console log area, absolute on /dev/block/sda
+
+[tools]
+fastboot = "/mnt/c/Users/paw/scoop/shims/fastboot.exe"
+adb = "/mnt/c/Users/paw/scoop/shims/adb.exe"
+python = "~/ios-work/mu-venv/bin/python"
